@@ -156,12 +156,14 @@ def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None
   
     num_scans = np.size(sid_list)
     data_name = '/entry/instrument/detector/data'
+    
     for i in tqdm(range(num_scans),desc="Progress"):
+        
         sid = int(sid_list[i])
         
         file_name = get_path(sid,det)
         num_subscan = len(file_name)
-         
+
         if num_subscan == 1:
             f = h5py.File(file_name[0],'r') 
             data = np.asarray(f[data_name],dtype=data_type)
@@ -178,6 +180,17 @@ def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None
             #data = list(db[sid].data(det))
             #data = np.asarray(np.squeeze(data),dtype=data_type)
         raw_size = np.shape(data)
+        
+        if i == 0:
+            last_totalPoints = raw_size[0]
+
+        # if frames are lost, pad with zeros
+        if raw_size[0] != last_totalPoints:
+            data = np.pad(data, ((0,last_totalPoints-raw_size[0]), (0,0), (0,0)),mode='constant')   
+        raw_size = np.shape(data)
+        
+        last_totalPoints = raw_size[0]
+        
         if threshold is not None:
             data[data<threshold[0]] = 0
             data[data>threshold[1]] = 0
@@ -294,10 +307,10 @@ def interp_sub_pix(data, shift_matrix):
     if sz_len == 3:     
         for i in tqdm(range(sz[0]),desc="Progress"):
             subset = data[i,:,:]
-            ly = np.int(np.floor(shift_matrix[i,0]))
-            hy = np.int(np.ceil(shift_matrix[i,0]))
-            lx = np.int(np.floor(shift_matrix[i,1]))
-            hx = np.int(np.ceil(shift_matrix[i,1]))
+            ly = int(np.floor(shift_matrix[i,0]))
+            hy = int(np.ceil(shift_matrix[i,0]))
+            lx = int(np.floor(shift_matrix[i,1]))
+            hx = int(np.ceil(shift_matrix[i,1]))
             lxly_subset = np.roll(subset,(ly,lx),axis=(0,1))
             lxhy_subset = np.roll(subset,(hy,lx),axis=(0,1))
             hxly_subset = np.roll(subset,(ly,hx),axis=(0,1))
@@ -309,8 +322,8 @@ def interp_sub_pix(data, shift_matrix):
     elif sz_len == 4:        
         for i in tqdm(range(sz[0]),desc="Progress"):
             subset = data[i,:,:,:]
-            l_bound = np.int(np.floor(shift_matrix[i]))
-            h_bound = np.int(np.ceil(shift_matrix[i]))      
+            l_bound = int(np.floor(shift_matrix[i]))
+            h_bound = int(np.ceil(shift_matrix[i]))      
             l_subset = np.roll(subset,l_bound,axis=0)
             h_subset = np.roll(subset,h_bound,axis=0)
             r = shift_matrix[i] - l_bound
@@ -318,10 +331,10 @@ def interp_sub_pix(data, shift_matrix):
     elif sz_len == 5:
         for i in tqdm(range(sz[0]),desc="Progress"):
             subset = data[i,:,:,:,:]
-            ly = np.int(np.floor(shift_matrix[i,0]))
-            hy = np.int(np.ceil(shift_matrix[i,0]))
-            lx = np.int(np.floor(shift_matrix[i,1]))
-            hx = np.int(np.ceil(shift_matrix[i,1]))
+            ly = int(np.floor(shift_matrix[i,0]))
+            hy = int(np.ceil(shift_matrix[i,0]))
+            lx = int(np.floor(shift_matrix[i,1]))
+            hx = int(np.ceil(shift_matrix[i,1]))
             lxly_subset = np.roll(subset,(ly,lx),axis=(0,1))
             lxhy_subset = np.roll(subset,(hy,lx),axis=(0,1))
             hxly_subset = np.roll(subset,(ly,hx),axis=(0,1))
@@ -541,6 +554,7 @@ class RSM:
             self.qyz_data = np.zeros((new_sz[0],trans_sz[0],trans_sz[2]),dtype=data_type)
         for i in tqdm(range(new_sz[0]),desc="Progress"):
             vq = interp3_oblique(X, Y, Z, self.det_data[i,:,:,:], M_inv, xq, yq, zq)
+#             print(vq)
             if data_store == 'full':
                 self.full_data[i,:,:,:] = vq
             else:
@@ -946,13 +960,13 @@ def interactive_map(names,im_stack,label,data_4D, cmap='jet', clim=None, marker_
     for i in range(l):
         axs[np.unravel_index(i,[layout_row,layout_col])].imshow(im_stack[i,:,:],cmap=cmap)
         axs[np.unravel_index(i,[layout_row,layout_col])].set_title(names[i])
-    axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[0,0,:,:],cmap=cmap,clim=clim)
+    im_diff = axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[0,0,:,:],cmap=cmap,clim=clim)
     axs[np.unravel_index(l,[layout_row,layout_col])].set_title(label)
     if layout_col*layout_row > num_maps:
         for i in range(num_maps,layout_row*layout_col):
             axs[np.unravel_index(i,[layout_row,layout_col])].axis('off')
     fig.tight_layout()
-
+    fig.colorbar(im_diff, ax=axs[np.unravel_index(l,[layout_row,layout_col])])
 
     def onclick(event):
         global row, col
@@ -1087,3 +1101,44 @@ def get_file_creation_time(file_path):
 def sort_files_by_creation_time(file_list):
     # Sort the file list based on their creation time
     return sorted(file_list, key=lambda file: get_file_creation_time(file))
+
+def block_mask(data, pos1, pos2, axes_swap=True,region = 0):
+    sz = np.shape(data)
+    data_new = np.reshape(data,[-1,sz[-2],sz[-1]])
+    sz_new = np.shape(data_new)
+    mask = np.ones((sz_new[-2],sz_new[-1]))
+    if axes_swap:
+        data_new = np.swapaxes(data_new,-2,-1)
+    if pos2[0]-pos1[0] == 0:
+        a_inv = 0
+        b_inv = pos1[0]
+        x, y = np.meshgrid(np.linspace(0,sz_new[-1],sz_new[-1]),np.linspace(0,sz_new[-2],sz_new[-2]))
+        y_x = a_inv*y+b_inv
+        if region == 0:
+            mask[y_x < x] = 0
+        else:
+            mask[y_x > x] = 0
+        for i in range(sz_new[0]):
+            data_new[i,:,:] = data_new[i,:,:]*mask
+    
+    
+    else:
+        a = (pos2[1]-pos1[1])/(pos2[0]-pos1[0])
+        b = pos1[1]-a*pos1[0]
+    
+        x, y = np.meshgrid(np.linspace(0,sz_new[-1],sz_new[-1]),np.linspace(0,sz_new[-2],sz_new[-2]))
+        x_y = a*x+b
+        if region == 0:
+            mask[x_y < y] = 0
+        else:
+            mask[x_y > y] = 0
+        for i in range(sz_new[0]):
+            data_new[i,:,:] = data_new[i,:,:]*mask
+    
+    if axes_swap:
+        data_new = np.reshape(np.swapaxes(data_new,-2,-1),sz)
+        data_new = np.swapaxes(data_new,-2,-1)
+    else:
+        data_new = np.reshape(data_new,sz)
+    return data_new
+        
