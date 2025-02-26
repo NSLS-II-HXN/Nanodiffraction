@@ -5,8 +5,12 @@ import numpy as np
 from pystackreg import StackReg
 import matplotlib.pyplot as plt
 import matplotlib.animation as manimation
-import tifffile
+import tifffile as tf
 import h5py
+import pandas as pd
+import datetime
+import warnings
+warnings.simplefilter(action='ignore', category=pd.errors.PerformanceWarning)
 #from matplotlib.widgets import Slider, Button
 #from ipywidgets import interact, interactive, fixed, interact_manual
 #import ipywidgets as widgets
@@ -16,11 +20,18 @@ from tqdm.auto import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pickle
 import os
-from databroker import db
+import pandas as pd
+import warnings
+import glob
+warnings.simplefilter(action='ignore', category=FutureWarning)
+warnings.simplefilter(action='ignore', category=UserWarning)
+
 import sys
 sys.path.insert(0,'/nsls2/data2/hxn/shared/config/bluesky_overlay/2023-1.0-py310-tiled/lib/python3.10/site-packages')
 from hxntools.CompositeBroker import db
 from hxntools.scan_info import get_scan_positions
+
+det_params = {'merlin1':55, "merlin2":55, "eiger2_images":75}
 
 
 def get_sid_list(str_list, interval):
@@ -42,12 +53,71 @@ def get_sid_list(str_list, interval):
             sid_list = np.concatenate((sid_list,tmp))
     return sid_list
 
+def get_scan_details(sid = -1):
+    param_dict = {"scan_id":int(sid)}
+    h = db[int(sid)]
+    df = db.get_table(h,stream_name = "baseline")
+    start_doc = h.start
+    mots = start_doc['motors']
+
+    # Create a datetime object from the Unix time.
+    datetime_object = datetime.datetime.fromtimestamp(start_doc["time"])
+    formatted_time = datetime_object.strftime('%Y-%m-%d %H:%M:%S')
+    param_dict["time"] = formatted_time
+    param_dict["motors"] = start_doc["motors"]
+    if "detectors" in start_doc.keys():
+        param_dict["detectors"] = start_doc["detectors"]
+        param_dict["scan_start1"] = start_doc["scan_start1"]
+        param_dict["num1"] = start_doc["num1"]
+        param_dict["scan_end1"] = start_doc["scan_end1"]
+        
+        if len(mots)==2:
+
+            param_dict["scan_start2"] = start_doc["scan_start2"]
+            param_dict["scan_end2"] = start_doc["scan_end2"]
+            param_dict["num2"] = start_doc["num2"]
+        param_dict["exposure_time"] = start_doc["exposure_time"]
+
+    elif "scan" in start_doc.keys():
+        param_dict["scan"] = start_doc["scan"]
+
+
+    
+    param_dict["zp_theta"] = np.round(df.zpsth.iloc[0],3)
+    param_dict["mll_theta"] = np.round(df.dsth.iloc[0],3)
+    param_dict["energy"] = np.round(df.energy.iloc[0],3)
+    return param_dict
+
+def export_scan_details(sid_list, wd):
+
+    for sid in tqdm(sid_list):
+        export_scan_metadata(sid, wd)
+
+def get_scan_metadata(sid):
+    
+    output = db.get_table(db[int(sid)],stream_name = "baseline")
+    df_dictionary = pd.DataFrame([get_scan_details(sid = int(sid))])
+    output = pd.concat([output, df_dictionary], ignore_index=True)
+    return output
+
+
+
+def export_scan_metadata(sid, wd):
+    output = db.get_table(db[int(sid)],stream_name = "baseline")
+    df_dictionary = pd.DataFrame([get_scan_details(sid = int(sid))])
+    output = pd.concat([output, df_dictionary], ignore_index=True)
+    sid_ = df_dictionary['scan_id']
+    save_as = os.path.join(wd,f"{sid_}_metadata.csv")
+    output.to_csv(save_as,index=False)
+    print(f"{save_as = }")
+    
+
 def load_ims(file_list):
     # stacking is along the first axis
     num_ims = np.size(file_list)
     for i in tqdm(range(num_ims),desc="Progress"):
         file_name = file_list[i]
-        im = tifffile.imread(file_name)
+        im = tf.imread(file_name)
         im_row, im_col = np.shape(im)
         if i == 0:
             im_stack = np.reshape(im,(1,im_row,im_col))
@@ -108,12 +178,17 @@ def create_file_list(data_path, prefix, postfix, sid_list):
         file_list.append(tmp)
     return file_list
 
-def align_im_stack(im_stack):
+def align_im_stack(im_stack, norm_intensity = False,reference = "previous"):
     # default stacking axis is zero
     #im_stack = np.moveaxis(im_stack,2,0)
+    if norm_intensity:
+        mean = np.mean(im_stack)
+        std = np.std(im_stack)
+        im_stack = (im_stack - mean) / std
     sr = StackReg(StackReg.TRANSLATION)
+    #sr = StackReg(StackReg.SCALED_ROTATION)
     #sr = StackReg(StackReg.RIGID_BODY)
-    tmats = sr.register_stack(im_stack, reference='previous')
+    tmats = sr.register_stack(im_stack, reference=reference)
     out = sr.transform_stack(im_stack)
     a = tmats[:,0,2]
     b = tmats[:,1,2]
@@ -152,7 +227,479 @@ def load_h5_data(file_list, roi, mask):
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
     return diff_data  
 
-def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None):
+def export_diff_data_as_tiff(first_sid,last_sid, det="eiger2_image", mon="sclr1_ch4", roi=None, mask=None, threshold=None, wd = '.', norm_with_ic = True):
+    # load diffraction data of a list of scans through databroker, with data being stacked at the first axis
+    # roi[row_start,col_start,row_size,col_size]
+    # mask has to be the same size of the image data, which corresponds to the last two axes
+    
+    sid_list = np.arange(first_sid,last_sid+1)
+    
+    data_type = 'float32'
+  
+    num_scans = np.size(sid_list)
+    data_name = '/entry/instrument/detector/data'
+    for i in tqdm(range(num_scans),desc="Progress"):
+        sid = int(sid_list[i])
+        print(f"{sid = }")
+
+        #skip 1d
+
+        hdr = db[int(sid)]
+        start_doc = hdr["start"]
+        scan_table = hdr.table()
+        if not start_doc["plan_type"] in ("FlyPlan1D",):
+
+            file_name = get_path(sid,det)
+            print(file_name)
+            num_subscan = len(file_name)
+            
+            if num_subscan == 1:
+                f = h5py.File(file_name[0],'r') 
+                data = np.asarray(f[data_name],dtype=data_type)
+                #data = np.asarray(f[data_name])
+                print(data.shape)
+            else:
+                sorted_files = sort_files_by_creation_time(file_name)
+                ind = 0
+                for name in sorted_files:
+                    f = h5py.File(name,'r')
+                    if ind == 0:
+                        data = np.asarray(f[data_name],dtype=data_type)
+                    else:   
+                        data = np.concatenate([data,np.asarray(f[data_name],dtype=data_type)],0)
+                    ind = ind + 1
+                    print(data.shape)
+                #data = list(db[sid].data(det))
+                #data = np.asarray(np.squeeze(data),dtype=data_type)
+            raw_size = np.shape(data)
+            if threshold is not None:
+                data[data<threshold[0]] = 0
+                data[data>threshold[1]] = 0
+            if mon is not None:
+                mon_data = db[sid].table()[mon]
+                ln = np.size(mon_data)
+                mon_array = np.zeros(ln,dtype=data_type)
+                for n in range(1,ln):
+                    mon_array[n] = mon_data[n] 
+                avg = np.mean(mon_array[mon_array != 0])
+                mon_array[mon_array == 0] = avg
+                
+            #misssing frame issue
+
+            if len(mon_array) != data.shape[0]:
+                if len(mon_array) > data.shape[0]:
+                    last_data_point = data[-1]  # Last data point along the first dimension
+                    last_data_point = last_data_point[np.newaxis, :,:]  
+                    data = np.concatenate((data, last_data_point), axis=0)
+                else:
+                    last_mon_array_element = mon_array[-1]
+                    mon_array = np.concatenate((mon_array, last_mon_array_element), axis=0)            
+            if norm_with_ic:
+                data = data/mon_array[:,np.newaxis,np.newaxis]
+            
+            if mask is not None:     
+                #sz = data.shape
+                data = data*mask
+            if roi is None:
+                data = np.flip(data[:,:,:],axis = 1)
+            else:
+                data = np.flip(data[:,roi[0]:roi[0]+roi[2],roi[1]:roi[1]+roi[3]],axis = 1)
+                
+            print(f"data size = {data.size/1_073_741_824 :.2f} GB")
+            save_folder =  os.path.join(wd,f"{sid}_diff_data")   
+
+            if not os.path.exists(save_folder):
+                os.makedirs(save_folder)
+                
+
+            saved_as = os.path.join(save_folder,f"{sid}_diff_{det}.tiff")
+            tf.imwrite(saved_as, data, dtype = np.float32)
+            export_scan_metadata(sid,save_folder)
+            scan_table.to_csv(os.path.join(save_folder,f"{sid}_scan_table.csv"))
+            print(f"{saved_as =}")
+            
+def export_diff_data_as_h5(sid_list, 
+                           det="eiger2_image", roi=None, 
+                           mask=None, threshold=None,
+                           norm_with = 'sclr1_ch4',
+                           wd = '.', compression = None):
+    # load diffraction data of a list of scans through databroker, with data being stacked at the first axis
+    # roi[row_start,col_start,row_size,col_size]
+    # mask has to be the same size of the image data, which corresponds to the last two axes
+    
+    data_type = 'float32'
+  
+    num_scans = np.size(sid_list)
+    data_name = '/entry/instrument/detector/data'
+    for i in tqdm(range(num_scans),desc="Progress"):
+        sid = int(sid_list[i])
+        print(f"{sid = }")
+
+        #skip 1d
+
+        hdr = db[int(sid)]
+        start_doc = hdr["start"]
+        sid = start_doc["scan_id"]
+        
+        if 'num1' and 'num2' in start_doc:
+            dim1,dim2 = start_doc['num1'],start_doc['num2']
+        elif 'shape' in start_doc:
+            dim1,dim2 = start_doc.shape
+        try:
+            xy_scan_positions = list(np.array(df[mots[0]]),np.array(df[mots[1]]))
+        except:
+            xy_scan_positions = list(get_scan_positions(hdr))
+
+        scan_table = get_scan_metadata(int(sid))
+        if not start_doc["plan_type"] in ("FlyPlan1D",):
+
+            file_name = get_path(sid,det)
+            num_subscan = len(file_name)
+            
+            if num_subscan == 1:
+                f = h5py.File(file_name[0],'r') 
+                data = np.asarray(f[data_name],dtype=data_type)
+            else:
+                sorted_files = sort_files_by_creation_time(file_name)
+                ind = 0
+                for name in sorted_files:
+                    f = h5py.File(name,'r')
+                    if ind == 0:
+                        data = np.asarray(f[data_name],dtype=data_type)
+                    else:   
+                        data = np.concatenate([data,np.asarray(f[data_name],dtype=data_type)],0)
+                    ind = ind + 1
+                #data = list(db[sid].data(det))
+                #data = np.asarray(np.squeeze(data),dtype=data_type)
+            _, roi1,roi2 = np.shape(data)
+
+            if threshold is not None:
+                data[data<threshold[0]] = 0
+                data[data>threshold[1]] = 0
+
+            if norm_with is not None:
+                #mon_array = np.stack(hdr.table(fill=True)[norm_with])
+                mon_array = np.array(list(hdr.data(str(norm_with)))).squeeze()
+                norm_data = data/mon_array[:,np.newaxis,np.newaxis]
+                print(f"data normalized with {norm_with} ")
+
+            
+            if mask is not None:     
+                #sz = data.shape
+                data = data*mask
+            if roi is None:
+                data = np.flip(data[:,:,:],axis = 1)
+            else:
+                data = np.flip(data[:,roi[0]:roi[0]+roi[2],roi[1]:roi[1]+roi[3]],axis = 1)
+                
+            print(f"data size = {data.size/1_073_741_824 :.2f} GB")
+
+            #save_folder =  os.path.join(wd,f"{sid}_diff_data")   
+
+            #if not os.path.exists(save_folder):
+                #os.makedirs(save_folder)
+
+            if wd:
+                save_folder = wd
+                
+            saved_as = os.path.join(save_folder,f"scan_{sid}_{det}")
+
+            f.close()
+
+            
+            with h5py.File(saved_as+'.h5','w') as f:
+
+                #data_group = f.create_group(f'{det}_raw_data')
+                data_group = f.create_group(f'/diff_data/{det}/')
+                data_group.create_dataset('raw_data',
+                                           data=data.reshape(dim1,dim2,roi1,roi2), 
+                                           compression = compression )
+                data_group.create_dataset('norm_data',
+                                           data=norm_data.reshape(dim1,dim2,roi1,roi2), 
+                                           compression = compression )
+                data_group.create_dataset('Io',
+                                           data=mon_array.reshape(dim1,dim2),
+                                           compression = compression )
+
+                data_group = f.create_group(f'/diff_data/scan/')
+                data_group.create_dataset('scan_positions',
+                            data=xy_scan_positions,
+                            compression = 'gzip')
+                scan_table.to_csv(saved_as+'_meta_data.csv')
+
+                # xrf_group = f.create_group('xrf_roi_data')
+                # names, xrf_2d = get_xrf_data(sid)
+                # xrf_group.create_dataset('xrf_roi_array', data = xrf_2d)
+                # xrf_group.create_dataset('xrf_elem_names', data = names)
+
+            f.close()
+            print(f"{saved_as =}")
+
+
+
+def export_diff_h5_log_file(logfile, diff_detector = 'merlin1', norm_with = 'sclr1_ch4',compression = None):
+
+    df = pd.read_csv(logfile)
+    sid_list = df['scan_id'].to_numpy(dtype = 'int')
+    angles = df['angle'].to_numpy()
+    print(sid_list)
+
+    dir_ = os.path.abspath(os.path.dirname(logfile))
+    folder_name = os.path.basename(logfile).split('.')[0]
+    save_folder =  os.path.join(dir_,folder_name+"_diff_data")
+    data_path = save_folder
+    os.makedirs(save_folder, exist_ok = True)
+
+    print(f"h5 files will be saved to {save_folder}")
+    
+    export_diff_data_as_h5(sid_list, 
+                           det=diff_detector,
+                           norm_with = norm_with,
+                           wd = save_folder, 
+                           compression = compression)
+    
+    print(f"All scans from {logfile} is exported to {save_folder}")
+
+
+
+def export_single_diff_data(param_dict):
+    
+    '''
+    load diffraction data of a single scan through databroker
+    roi[row_start,col_start,row_size,col_size]
+    mask has to be the same size of the image data, which corresponds to the last two axes
+    
+    param_dict = {wd:'.', 
+                 "sid":-1, 
+                 "det":"merlin1", 
+                 "mon":"sclr1_ch4", 
+                 "roi":None, 
+                 "mask":None, 
+                 "threshold":None}
+    '''
+
+    det=param_dict["det"]
+    mon=param_dict["mon"]
+    roi=param_dict["roi"]
+    mask=param_dict["mask"]
+    threshold=param_dict["threshold"]
+    wd = param_dict["wd"]
+
+
+    data_type = 'float32'
+    data_name = '/entry/instrument/detector/data'
+    sid = param_dict["sid"]
+    start_doc = db[int(sid)].start
+    sid = start_doc["scan_id"]
+    param_dict["sid"] = sid
+    file_name = get_path(sid,det)
+    num_subscan = len(file_name)
+    scan_table = db[sid].table()
+
+    #print(f"Loading{sid} please wait...")
+        
+
+    hdr = db[int(sid)]
+    start_doc = hdr["start"]
+    sid = start_doc["scan_id"]
+    
+    if 'num1' and 'num2' in start_doc:
+        dim1,dim2 = start_doc['num1'],start_doc['num2']
+    elif 'shape' in start_doc:
+        dim1,dim2 = start_doc.shape
+    try:
+        xy_scan_positions = list(np.array(df[mots[0]]),np.array(df[mots[1]]))
+    except:
+        xy_scan_positions = list(get_scan_positions(hdr))
+
+    scan_table = get_scan_metadata(int(sid))
+    if not start_doc["plan_type"] in ("FlyPlan1D",):
+
+        file_name = get_path(sid,det)
+        num_subscan = len(file_name)
+        
+        if num_subscan == 1:
+            f = h5py.File(file_name[0],'r') 
+            data = np.asarray(f[data_name],dtype=data_type)
+        else:
+            sorted_files = sort_files_by_creation_time(file_name)
+            ind = 0
+            for name in sorted_files:
+                f = h5py.File(name,'r')
+                if ind == 0:
+                    data = np.asarray(f[data_name],dtype=data_type)
+                else:   
+                    data = np.concatenate([data,np.asarray(f[data_name],dtype=data_type)],0)
+                ind = ind + 1
+            #data = list(db[sid].data(det))
+            #data = np.asarray(np.squeeze(data),dtype=data_type)
+        _, roi1,roi2 = np.shape(data)
+
+        if threshold is not None:
+            data[data<threshold[0]] = 0
+            data[data>threshold[1]] = 0
+
+        norm_with = mon
+
+        if norm_with is not None:
+            #mon_array = np.stack(hdr.table(fill=True)[norm_with])
+            mon_array = np.array(list(hdr.data(str(norm_with)))).squeeze()
+            norm_data = data/mon_array[:,np.newaxis,np.newaxis]
+            print(f"data normalized with {norm_with} ")
+
+        
+        if mask is not None:     
+            #sz = data.shape
+            data = data*mask
+        if roi is None:
+            data = np.flip(data[:,:,:],axis = 1)
+        else:
+            data = np.flip(data[:,roi[0]:roi[0]+roi[2],roi[1]:roi[1]+roi[3]],axis = 1)
+            
+        print(f"data size = {data.size/1_073_741_824 :.2f} GB")
+
+        #save_folder =  os.path.join(wd,f"{sid}_diff_data")   
+
+        #if not os.path.exists(save_folder):
+            #os.makedirs(save_folder)
+
+        if wd:
+            save_folder = wd
+            
+        saved_as = os.path.join(save_folder,f"scan_{sid}_{det}")
+
+        f.close()
+
+    print(f"data reshaped to {data.shape}")
+
+    save_folder =  os.path.join(wd,f"{sid}_diff_data")
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+
+    saved_as = os.path.join(save_folder,f"{sid}_diff_{det}.tiff")
+    if mon is not None:
+        tf.imwrite(saved_as, data.reshape(dim1,dim2,roi1,roi2), dtype = np.float32)
+
+    else:
+        tf.imwrite(saved_as, data.reshape(dim1,dim2,roi1,roi2).astype('uint16'), imagej=True)
+
+    export_scan_metadata(sid,save_folder)
+    scan_table.to_csv(os.path.join(save_folder,f"{sid}_scan_table.csv"))
+    print(f"{saved_as =}")
+
+def export_single_diff_data_old_scan(param_dict):
+    
+    '''
+    load diffraction data of a single scan through databroker
+    roi[row_start,col_start,row_size,col_size]
+    mask has to be the same size of the image data, which corresponds to the last two axes
+    
+    param_dict = {wd:'.', 
+                 "sid":-1, 
+                 "det":"merlin1", 
+                 "mon":"sclr1_ch4", 
+                 "roi":None, 
+                 "mask":None, 
+                 "threshold":None}
+    '''
+
+    det=param_dict["det"]
+    mon=param_dict["mon"]
+    roi=param_dict["roi"]
+    mask=param_dict["mask"]
+    threshold=param_dict["threshold"]
+    wd = param_dict["wd"]
+
+
+    data_type = 'float32'
+    data_name = '/entry/instrument/detector/data'
+    sid = param_dict["sid"]
+    start_doc = db[int(sid)].start
+    sid = start_doc["scan_id"]
+    param_dict["sid"] = sid
+    file_name = get_path(sid,det)
+    num_subscan = len(file_name)
+    scan_table = db[sid].table()
+
+    #print(f"Loading{sid} please wait...")
+        
+    if num_subscan == 1:
+        f = h5py.File(file_name[0],'r') 
+        data = np.asarray(f[data_name],dtype=data_type)
+    else:
+        sorted_files = sort_files_by_creation_time(file_name)
+        ind = 0
+        for name in sorted_files:
+            f = h5py.File(name,'r')
+            if ind == 0:
+                data = np.asarray(f[data_name],dtype=data_type)
+            else:   
+                data = np.concatenate([data,np.asarray(f[data_name],dtype=data_type)],0)
+            ind = ind + 1
+        #data = list(db[sid].data(det))
+        #data = np.asarray(np.squeeze(data),dtype=data_type)
+    raw_size = np.shape(data)
+    if threshold is not None:
+        data[data<threshold[0]] = 0
+        data[data>threshold[1]] = 0
+    if mon is not None:
+        mon_data = scan_table[mon]
+        ln = np.size(mon_data)
+        mon_array = np.zeros(ln,dtype=data_type)
+        for n in range(1,ln):
+            mon_array[n] = mon_data[n] 
+        avg = np.mean(mon_array[mon_array != 0])
+        mon_array[mon_array == 0] = avg
+        
+    #misssing frame issue
+
+        if len(mon_array) != data.shape[0]:
+            if len(mon_array) > data.shape[0]:
+                last_data_point = data[-1]  # Last data point along the first dimension
+                last_data_point = last_data_point[np.newaxis, :,:]  
+                data = np.concatenate((data, last_data_point), axis=0)
+            else:
+                last_mon_array_element = mon_array[-1]
+                mon_array = np.concatenate((mon_array, last_mon_array_element), axis=0)            
+        
+        data = data/mon_array[:,np.newaxis,np.newaxis]
+    
+    if mask is not None:     
+        #sz = data.shape
+        data = data*mask
+    if roi is None:
+        data = np.flip(data[:,:,:],axis = 1)
+    else:
+        data = np.flip(data[:,roi[0]:roi[0]+roi[2],roi[1]:roi[1]+roi[3]],axis = 1)
+        
+    print(f"data size = {data.size/1_073_741_824 :.2f} GB")
+    data_shape = data.shape
+    print(f"{data_shape = } ")
+    data_shape = data.shape
+    dim1 = start_doc['num1']
+    dim2 = start_doc['num2']
+
+    data = data.reshape(dim2,dim1,data_shape[-2],data_shape[-1])
+    data=np.flip(data, axis =2)
+
+    print(f"data reshaped to {data.shape}")
+
+    save_folder =  os.path.join(wd,f"{sid}_diff_data")
+    if not os.path.exists(save_folder):
+        os.makedirs(save_folder)
+
+    saved_as = os.path.join(save_folder,f"{sid}_diff_{det}.tiff")
+    if mon is not None:
+        tf.imwrite(saved_as, data, dtype = np.float32)
+
+    else:
+        tf.imwrite(saved_as, data.astype('uint16'), imagej=True)
+
+    export_scan_metadata(sid,save_folder)
+    scan_table.to_csv(os.path.join(save_folder,f"{sid}_scan_table.csv"))
+    print(f"{saved_as =}")
+
+def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None, save_intermediate_data = False, wd = '.', norm_with_ic = True):
     # load diffraction data of a list of scans through databroker, with data being stacked at the first axis
     # roi[row_start,col_start,row_size,col_size]
     # mask has to be the same size of the image data, which corresponds to the last two axes
@@ -160,14 +707,12 @@ def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None
   
     num_scans = np.size(sid_list)
     data_name = '/entry/instrument/detector/data'
-    
     for i in tqdm(range(num_scans),desc="Progress"):
-        
         sid = int(sid_list[i])
-        
+        print(f"{sid = }")
         file_name = get_path(sid,det)
         num_subscan = len(file_name)
-
+         
         if num_subscan == 1:
             f = h5py.File(file_name[0],'r') 
             data = np.asarray(f[data_name],dtype=data_type)
@@ -184,29 +729,31 @@ def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None
             #data = list(db[sid].data(det))
             #data = np.asarray(np.squeeze(data),dtype=data_type)
         raw_size = np.shape(data)
-        
-        if i == 0:
-            last_totalPoints = raw_size[0]
-
-        # if frames are lost, pad with zeros
-        if raw_size[0] != last_totalPoints:
-            data = np.pad(data, ((0,last_totalPoints-raw_size[0]), (0,0), (0,0)),mode='constant')   
-        raw_size = np.shape(data)
-        
-        last_totalPoints = raw_size[0]
-        
         if threshold is not None:
             data[data<threshold[0]] = 0
             data[data>threshold[1]] = 0
         if mon is not None:
-            mon_data = np.array(list(db[sid].data(mon))).squeeze()
+            mon_data = db[sid].table()[mon]
             ln = np.size(mon_data)
             mon_array = np.zeros(ln,dtype=data_type)
             for n in range(1,ln):
                 mon_array[n] = mon_data[n] 
             avg = np.mean(mon_array[mon_array != 0])
             mon_array[mon_array == 0] = avg
+            
+        #misssing frame issue
+
+        if len(mon_array) != data.shape[0]:
+            if len(mon_array) > data.shape[0]:
+                last_data_point = data[-1]  # Last data point along the first dimension
+                last_data_point = last_data_point[np.newaxis, :,:]  
+                data = np.concatenate((data, last_data_point), axis=0)
+            else:
+                last_mon_array_element = mon_array[-1]
+                mon_array = np.concatenate((mon_array, last_mon_array_element), axis=0)            
+        if norm_with_ic:
             data = data/mon_array[:,np.newaxis,np.newaxis]
+        
         if mask is not None:     
             #sz = data.shape
             data = data*mask
@@ -214,17 +761,72 @@ def load_h5_data_db(sid_list, det, mon=None, roi=None, mask=None, threshold=None
             data = np.flip(data[:,:,:],axis = 1)
         else:
             data = np.flip(data[:,roi[0]:roi[0]+roi[2],roi[1]:roi[1]+roi[3]],axis = 1)
+            
+        print(f"{data.size = }")
+            
+        if save_intermediate_data:
+            saved_as = os.path.join(wd,f"{sid}_diff_processed.tiff")
+            tf.imwrite(saved_as, data, dtype = np.float32)
+            print(f"{saved_as =}")
+        
         if i == 0:
-            print("Total scan points: {}; raw image row: {}; raw image col: {}".format(raw_size[0],raw_size[1],raw_size[2]))
+            print(f"Total scan points: {raw_size[0]}; raw image row: {raw_size[1]}; raw image col: {raw_size[2]}")
             data_size = np.shape(data)
-            print("Total scan points: {}; data image row: {}; data image col: {}".format(data_size[0],data_size[1],data_size[2]))
+            print(f"Total scan points: {data_size[0]}; data image row: {data_size[1]}; data image col: {data_size[2]}")
             diff_data = np.zeros(np.append(num_scans,np.shape(data)),dtype=data_type)
+            #TODO maybe save intermediate data , sometime one file fails
         sz = diff_data.shape    
         diff_data[i] = np.resize(data,(sz[1],sz[2],sz[3])) # in case there are lost frames
     if  num_scans == 1: # assume it is a rocking curve scan
         diff_data = np.swapaxes(diff_data,0,1) # move angle to the first axis
-        print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
-    return diff_data   
+        print(f"Assume it is a rocking curve scan; number of angles = {diff_data.shape[0]}")
+    return diff_data  
+
+
+
+
+
+
+def load_xrf_rois(sid, wd, norm = None):
+
+    h = db[int(sid)]
+    df = h.table()
+    start_doc  = h['start']
+    sid = start_doc ["scan_id"]
+    list_of_rois = [roi for roi in df.columns if roi.startswith("Det")]
+    if x is None:
+        x = start_doc['motor1']
+        #x = hdr['motors'][0]
+    x_data = np.asarray(df[x])
+
+    if y is None:
+        y = start_doc['motor2']
+        #y = hdr['motors'][1]
+    y_data = np.asarray(df[y])
+
+    if norm is not None:
+        monitor = np.asarray(df[norm], dtype=np.float32)
+        monitor = np.where(monitor == 0, np.nanmin(monitor),monitor) #patch for dropping first data point
+        spectrum = spectrum/(monitor)
+
+    nx, ny = start_doc["shape"]
+
+    pass
+
+def diff_data_from_local(sid_list, wd):
+    num_scans = len(sid_list)
+    first_file = os.path.join(wd, f"{sid_list[0]}_diff_processed.tiff")
+    first_data = tf.imread(first_file)
+    data_shape = np.shape(first_data)
+    
+    diff_data = np.zeros((num_scans,) + data_shape, dtype=np.float32)
+    
+    for i, sid in tqdm(enumerate(sid_list), desc="Stacking"):
+        filename = os.path.join(wd, f"{sid}_{det}.tiff")
+        data = tf.imread(filename)
+        diff_data[i] = data
+        
+    return diff_data
 
 def sum_all_h5_data_db(sid_list, det):
     # load a list of scans, with data being stacked at the first axis
@@ -311,10 +913,10 @@ def interp_sub_pix(data, shift_matrix):
     if sz_len == 3:     
         for i in tqdm(range(sz[0]),desc="Progress"):
             subset = data[i,:,:]
-            ly = int(np.floor(shift_matrix[i,0]))
-            hy = int(np.ceil(shift_matrix[i,0]))
-            lx = int(np.floor(shift_matrix[i,1]))
-            hx = int(np.ceil(shift_matrix[i,1]))
+            ly = np.int(np.floor(shift_matrix[i,0]))
+            hy = np.int(np.ceil(shift_matrix[i,0]))
+            lx = np.int(np.floor(shift_matrix[i,1]))
+            hx = np.int(np.ceil(shift_matrix[i,1]))
             lxly_subset = np.roll(subset,(ly,lx),axis=(0,1))
             lxhy_subset = np.roll(subset,(hy,lx),axis=(0,1))
             hxly_subset = np.roll(subset,(ly,hx),axis=(0,1))
@@ -326,8 +928,8 @@ def interp_sub_pix(data, shift_matrix):
     elif sz_len == 4:        
         for i in tqdm(range(sz[0]),desc="Progress"):
             subset = data[i,:,:,:]
-            l_bound = int(np.floor(shift_matrix[i]))
-            h_bound = int(np.ceil(shift_matrix[i]))      
+            l_bound = np.int(np.floor(shift_matrix[i]))
+            h_bound = np.int(np.ceil(shift_matrix[i]))      
             l_subset = np.roll(subset,l_bound,axis=0)
             h_subset = np.roll(subset,h_bound,axis=0)
             r = shift_matrix[i] - l_bound
@@ -335,10 +937,10 @@ def interp_sub_pix(data, shift_matrix):
     elif sz_len == 5:
         for i in tqdm(range(sz[0]),desc="Progress"):
             subset = data[i,:,:,:,:]
-            ly = int(np.floor(shift_matrix[i,0]))
-            hy = int(np.ceil(shift_matrix[i,0]))
-            lx = int(np.floor(shift_matrix[i,1]))
-            hx = int(np.ceil(shift_matrix[i,1]))
+            ly = np.int(np.floor(shift_matrix[i,0]))
+            hy = np.int(np.ceil(shift_matrix[i,0]))
+            lx = np.int(np.floor(shift_matrix[i,1]))
+            hx = np.int(np.ceil(shift_matrix[i,1]))
             lxly_subset = np.roll(subset,(ly,lx),axis=(0,1))
             lxhy_subset = np.roll(subset,(hy,lx),axis=(0,1))
             hxly_subset = np.roll(subset,(ly,hx),axis=(0,1))
@@ -558,7 +1160,6 @@ class RSM:
             self.qyz_data = np.zeros((new_sz[0],trans_sz[0],trans_sz[2]),dtype=data_type)
         for i in tqdm(range(new_sz[0]),desc="Progress"):
             vq = interp3_oblique(X, Y, Z, self.det_data[i,:,:,:], M_inv, xq, yq, zq)
-#             print(vq)
             if data_store == 'full':
                 self.full_data[i,:,:,:] = vq
             else:
@@ -853,16 +1454,16 @@ class RSM:
             print("Directory '%s' created" %output_path)
         
         file_name = ''.join([output_path,'tot_intensity_map.tif'])
-        tifffile.imsave(file_name,np.asarray(self.tot,dtype=np.float32),imagej=True)
+        tf.imsave(file_name,np.asarray(self.tot,dtype=np.float32),imagej=True)
 
         file_name = ''.join([output_path,'strain_map.tif'])
-        tifffile.imwrite(file_name,np.asarray(self.strain,dtype=np.float32),imagej=True)
+        tf.imwrite(file_name,np.asarray(self.strain,dtype=np.float32),imagej=True)
 
         file_name = ''.join([output_path,'tilt_x_map.tif'])
-        tifffile.imwrite(file_name,np.asarray(self.tilt_x,dtype=np.float32),imagej=True)
+        tf.imwrite(file_name,np.asarray(self.tilt_x,dtype=np.float32),imagej=True)
 
         file_name = ''.join([output_path,'tilt_y_map.tif'])
-        tifffile.imwrite(file_name,np.asarray(self.tilt_y,dtype=np.float32),imagej=True)
+        tf.imwrite(file_name,np.asarray(self.tilt_y,dtype=np.float32),imagej=True)
 
         file_name = ''.join([output_path,'pos_rsm_xz.obj'])
         if self.data_store == 'full':
@@ -964,13 +1565,13 @@ def interactive_map(names,im_stack,label,data_4D, cmap='jet', clim=None, marker_
     for i in range(l):
         axs[np.unravel_index(i,[layout_row,layout_col])].imshow(im_stack[i,:,:],cmap=cmap)
         axs[np.unravel_index(i,[layout_row,layout_col])].set_title(names[i])
-    im_diff = axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[0,0,:,:],cmap=cmap,clim=clim)
+    axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[0,0,:,:],cmap=cmap,clim=clim)
     axs[np.unravel_index(l,[layout_row,layout_col])].set_title(label)
     if layout_col*layout_row > num_maps:
         for i in range(num_maps,layout_row*layout_col):
             axs[np.unravel_index(i,[layout_row,layout_col])].axis('off')
     fig.tight_layout()
-    fig.colorbar(im_diff, ax=axs[np.unravel_index(l,[layout_row,layout_col])])
+
 
     def onclick(event):
         global row, col
@@ -1105,44 +1706,3 @@ def get_file_creation_time(file_path):
 def sort_files_by_creation_time(file_list):
     # Sort the file list based on their creation time
     return sorted(file_list, key=lambda file: get_file_creation_time(file))
-
-def block_mask(data, pos1, pos2, axes_swap=True,region = 0):
-    sz = np.shape(data)
-    data_new = np.reshape(data,[-1,sz[-2],sz[-1]])
-    sz_new = np.shape(data_new)
-    mask = np.ones((sz_new[-2],sz_new[-1]))
-    if axes_swap:
-        data_new = np.swapaxes(data_new,-2,-1)
-    if pos2[0]-pos1[0] == 0:
-        a_inv = 0
-        b_inv = pos1[0]
-        x, y = np.meshgrid(np.linspace(0,sz_new[-1],sz_new[-1]),np.linspace(0,sz_new[-2],sz_new[-2]))
-        y_x = a_inv*y+b_inv
-        if region == 0:
-            mask[y_x < x] = 0
-        else:
-            mask[y_x > x] = 0
-        for i in range(sz_new[0]):
-            data_new[i,:,:] = data_new[i,:,:]*mask
-    
-    
-    else:
-        a = (pos2[1]-pos1[1])/(pos2[0]-pos1[0])
-        b = pos1[1]-a*pos1[0]
-    
-        x, y = np.meshgrid(np.linspace(0,sz_new[-1],sz_new[-1]),np.linspace(0,sz_new[-2],sz_new[-2]))
-        x_y = a*x+b
-        if region == 0:
-            mask[x_y < y] = 0
-        else:
-            mask[x_y > y] = 0
-        for i in range(sz_new[0]):
-            data_new[i,:,:] = data_new[i,:,:]*mask
-    
-    if axes_swap:
-        data_new = np.reshape(np.swapaxes(data_new,-2,-1),sz)
-        data_new = np.swapaxes(data_new,-2,-1)
-    else:
-        data_new = np.reshape(data_new,sz)
-    return data_new
-        
