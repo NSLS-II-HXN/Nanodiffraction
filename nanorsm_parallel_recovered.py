@@ -19,6 +19,7 @@ from hxntools.CompositeBroker import db
 from hxntools.scan_info import get_scan_positions
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import concurrent.futures as concurrent
+import gc
 
 def get_sid_list(str_list, interval):
     num_elem = np.size(str_list)
@@ -256,6 +257,59 @@ def load_h5_data_db(sid,det,mon=None,roi=None,mask=None,threshold=None):
         # Resize (if necessary) and return the processed scan.
         return proc_data
 
+def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None):
+
+
+    sid = int(sid)
+    file_names = sort_files_by_creation_time(get_path(sid, det))
+    data_name = '/entry/instrument/detector/data'
+
+    data_blocks = []
+
+    for fname in file_names:
+        with h5py.File(fname, 'r') as f:
+            dset = f[data_name]
+            shape = dset.shape
+            dtype = np.float32  # target dtype
+
+            # Determine ROI slice
+            if roi is None:
+                roi_slices = (slice(None), slice(None), slice(None))
+            else:
+                r0, c0, rsz, csz = roi
+                roi_slices = (slice(None), slice(r0, r0 + rsz), slice(c0, c0 + csz))
+
+            # Allocate array for reading (smaller than full dataset)
+            temp = np.empty(dset[roi_slices].shape, dtype=dtype)
+            dset.read_direct(temp, source_sel=roi_slices)
+
+            data_blocks.append(temp)
+
+    data = np.concatenate(data_blocks, axis=0) if len(data_blocks) > 1 else data_blocks[0]
+
+    # Threshold
+    if threshold is not None:
+        np.clip(data, threshold[0], threshold[1], out=data)
+        data[(data == threshold[0]) | (data == threshold[1])] = 0
+
+    # Monitor normalization
+    if mon is not None:
+        mon_array = np.asarray(list(db[sid].data(mon))).squeeze()
+        avg = np.mean(mon_array[mon_array != 0])
+        mon_array[mon_array == 0] = avg
+        if mon_array.shape[0] > data.shape[0]:
+            data = np.pad(data, ((0,mon_array.shape[0]-data.shape[0]), (0,0), (0,0)),mode='constant') 
+        data /= mon_array[:, np.newaxis, np.newaxis]*mon_array[0]
+
+    # Mask
+    if mask is not None:
+        data *= mask
+
+    # Flip vertically (along axis=1)
+    proc_data = np.flip(data, axis=1)
+
+    return proc_data
+
 def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, max_workers = 10):
     """
     Load diffraction data from a list of scans (given by sid_list) through databroker
@@ -281,7 +335,7 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
     max_workers = min(max_workers, num_cores)
 
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(load_h5_data_db, sid_list[i],det, mon,roi,mask,threshold): i for i in range(num_scans)}
+        futures = {executor.submit(load_h5_data_db_v1, sid_list[i],det, mon,roi,mask,threshold): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
             try:
@@ -476,7 +530,7 @@ def trans_coor3D(X, Y, Z, M):
         X.ravel(),
         Y.ravel(),
         Z.ravel()])
-    transformed = np.array(M @ coords)
+    transformed = np.asarray(M @ coords)
     cX = np.reshape(transformed[0, :], sz)
     cY = np.reshape(transformed[1, :], sz)
     cZ = np.reshape(transformed[2, :], sz)
@@ -496,7 +550,7 @@ def create_grid(X, Y, Z, M):
     x_range = np.arange(x_coords.min(), x_coords.max(), dx)
     y_range = np.arange(y_coords.min(), y_coords.max(), dy)
     z_range = np.arange(z_coords.min(), z_coords.max(), dz)
-    (Vx, Vy, Vz) = np.meshgrid(x_range, y_range, z_range, indexing = 'ij')
+    (Vx, Vy, Vz) = np.meshgrid(x_range, y_range, z_range)
     pix_sz = np.array([
         dx,
         dy,
@@ -566,17 +620,18 @@ class RSM:
         self.k = 1e4 / (12.398/energy)
 
     def calcRSM(self, coor, data_store='reduced', desired_workers=10):
-        """
+    
+        '''
         Calculate reciprocal space mapping (RSM) from the detector data.
         The bulk of the work is done by interpolating the transformed detector data
         onto a grid. Parallel processing is used to speed up the per-scan interpolation.
-        """
+        '''
+        
         # --- Standard computations to set up matrices and grids ---
         sz = np.shape(self.det_data)
         data_type = self.det_data.dtype
-        sz_len = np.size(sz)
-        det_row = sz[sz_len - 2]
-        det_col = sz[sz_len - 1]
+        det_row = sz[-2]
+        det_col = sz[-1]
         Mx = np.matrix([[1., 0., 0.],
                         [0., np.cos(self.delta), -np.sin(self.delta)],
                         [0., np.sin(self.delta), np.cos(self.delta)]])
@@ -633,7 +688,9 @@ class RSM:
         trans_sz = np.shape(xq)
 
         # --- Reshape and prepare the detector data ---
-        self.det_data = np.squeeze(np.swapaxes(np.expand_dims(self.det_data, axis=-1), 0, -1), 0)
+        # self.det_data = np.squeeze(np.swapaxes(np.expand_dims(self.det_data, axis=-1), 0, -1), 0)
+        self.det_data = np.moveaxis(self.det_data, 0, -1)
+
         sz = np.shape(self.det_data)
         self.det_data = np.reshape(self.det_data, [-1, sz[-3], sz[-2], sz[-1]])
         new_sz = np.shape(self.det_data)
@@ -727,8 +784,7 @@ class RSM:
         self.strain = -shift_qz * (self.zq[0, 0, 1] - self.zq[0, 0, 0]) / np.linalg.norm(self.h)
         self.tilt_x = shift_qx * (self.xq[0, 1, 0] - self.xq[0, 0, 0]) / np.linalg.norm(self.h)
         self.tilt_y = shift_qy * (self.yq[1, 0, 0] - self.yq[0, 0, 0]) / np.linalg.norm(self.h)
-        self.tot = np.sum(qz_pos, -1)
-        
+        self.tot = np.sum(qz_pos, -1) 
     def disp(self):
         
         fig = plt.figure(1)
@@ -794,7 +850,7 @@ class RSM:
             ax.set_ylabel('tilt_y (degree)')
         plt.tight_layout()
         #plt.savefig('./result.png')
-        
+              
     def save(self,output_path):
 
         if not os.path.exists(output_path):
@@ -840,6 +896,11 @@ class RSM:
         if plt.fignum_exists(1):
             file_name = ''.join([output_path,'results.png'])
             plt.savefig(file_name)
+
+
+
+
+
 def cen_of_mass(c):
     c = c.ravel()
     tot = np.sum(c)
@@ -888,55 +949,72 @@ def get_path(scan_id, key_name='merlin1', db=db):
     fpath = [os.path.join(rootpath, file_path) for file_path in flist]
     return fpath
 
-def interactive_map(names,im_stack,label,data_4D, cmap='jet', clim=None, marker_color = 'black'):
+def interactive_map(
+    names,
+    im_stack,
+    label,
+    data_4D,
+    cmap='jet',
+    clim=None,
+    marker_color='black'
+):
+    n = min(len(names), im_stack.shape[0])
+    total = n + 1
+    ncols, nrows = 3, int(np.ceil(total / 3))
 
-    l = len(names)
-    im_sz = np.shape(im_stack)
-    l = np.fmin(l,im_sz[0])
+    fig, axs = plt.subplots(
+        nrows, ncols,
+        figsize=(3 * ncols, 3 * nrows),
+        gridspec_kw={'wspace': 0.1, 'hspace': 0.2}
+    )
+    axs = axs.ravel()
 
-    num_maps = l + 1
-    layout_row = np.round(np.sqrt(num_maps))
-    layout_col = np.ceil(num_maps/layout_row)
-    layout_row = int (layout_row)
-    layout_col = int (layout_col)
+    # initial plotting
+    for ax, name, img in zip(axs, names[:n], im_stack[:n]):
+        ax.imshow(img, cmap=cmap, aspect='auto')
+        ax.set_title(name, fontsize=9)
+        ax.axis('off')
 
-    fig, axs = plt.subplots(layout_row,layout_col)
-    size_y = layout_row*4
-    size_x = layout_col*6
-    if size_x < 8:
-        size_y = size_y*8/size_x
-        size_x = 8
-    if size_y < 6:
-        size_x = size_x*6/size_y
-        size_y = 6
-    fig.set_size_inches(size_x,size_y)
-    for i in range(l):
-        axs[np.unravel_index(i,[layout_row,layout_col])].imshow(im_stack[i,:,:],cmap=cmap)
-        axs[np.unravel_index(i,[layout_row,layout_col])].set_title(names[i])
-    im_diff = axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[0,0,:,:],cmap=cmap,clim=clim)
-    axs[np.unravel_index(l,[layout_row,layout_col])].set_title(label)
-    if layout_col*layout_row > num_maps:
-        for i in range(num_maps,layout_row*layout_col):
-            axs[np.unravel_index(i,[layout_row,layout_col])].axis('off')
+    diff_ax = axs[n]
+    im = diff_ax.imshow(data_4D[0, 0], cmap=cmap, clim=clim, aspect='auto')
+    diff_ax.set_title(label, fontsize=9)
+    diff_ax.axis('off')
+
+    for ax in axs[total:]:
+        ax.axis('off')
+
+    cbar = fig.colorbar(im, ax=diff_ax, fraction=0.046, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
+
+    # tighten BEFORE connecting
     fig.tight_layout()
-    fig.colorbar(im_diff, ax=axs[np.unravel_index(l,[layout_row,layout_col])])
 
     def onclick(event):
-        global row, col
-        col, row = event.xdata, event.ydata
-        if col is not None and row is not None and col <= im_sz[2] and row <= im_sz[1]:
-            row = int(np.round(row))
-            col = int(np.round(col))
-            for i in range(l):
-                axs[np.unravel_index(i,[layout_row,layout_col])].clear()
-                axs[np.unravel_index(i,[layout_row,layout_col])].imshow(im_stack[i,:,:],cmap=cmap)
-                axs[np.unravel_index(i,[layout_row,layout_col])].set_title(names[i])
-                axs[np.unravel_index(i,[layout_row,layout_col])].plot(col,row,marker='o',markersize=4, color=marker_color)
-            axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[row,col,:,:],cmap=cmap,clim=clim)
-            axs[np.unravel_index(l,[layout_row,layout_col])].set_title(label)
-        fig.canvas.draw_idle()
+        if event.inaxes not in axs:
+            return
+        col, row = int(round(event.xdata)), int(round(event.ydata))
+        if not (0 <= col < im_stack.shape[2] and 0 <= row < im_stack.shape[1]):
+            return
 
-    cid = fig.canvas.mpl_connect('button_press_event', onclick)
+        # redraw each panel
+        for i, ax in enumerate(axs[:total]):
+            ax.clear()
+            if i < n:
+                ax.imshow(im_stack[i], cmap=cmap, aspect='auto')
+                ax.plot(col, row, 'o', color=marker_color, ms=5)
+                ax.set_title(names[i], fontsize=9)
+            else:
+                ax.imshow(data_4D[row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.set_title(label, fontsize=9)
+            ax.axis('off')
+
+        # immediate redraw
+        fig.canvas.draw()
+
+    # connect *after* layout
+    fig.canvas.mpl_connect('button_press_event', onclick)
+
+    fig.show()
 
 def load_diff_data(sid,scaler_names,det_name, mon = None):
     h = db[sid]
