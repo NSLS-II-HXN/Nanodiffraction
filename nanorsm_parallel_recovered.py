@@ -1,13 +1,12 @@
-# Source Generated with Decompyle++
-# File: nanorsm_parallel.cpython-312.pyc (Python 3.12)
-
 import numpy as np
 from pystackreg import StackReg
 import matplotlib.pyplot as plt
 import matplotlib.animation as manimation
 import tifffile
 import h5py
-import csv
+from scipy.optimize import curve_fit
+from scipy.special import wofz  # For Voigt
+#import csv
 from tqdm.auto import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pickle
@@ -501,7 +500,7 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     '''
     sz = np.shape(data)
     sz_len = np.size(sz)
-    results = np.zeros_like(data)
+    # results = np.zeros_like(data)
     process_func = None
     if sz_len == 3:
         process_func = process_3d
@@ -517,10 +516,12 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         # Submit a task for each slice
         futures = {executor.submit(process_func, subset, shift_matrix, index): index for index, subset in enumerate(data)}
+
         for future in tqdm(as_completed(futures), total=sz[0], desc="Parallel interp_sub_pix"):
             idx = futures[future]
-            results[idx] = future.result()
-    return results
+            data[idx] = future.result()
+    
+    return data
 
 
 def trans_coor3D(X, Y, Z, M):
@@ -605,7 +606,7 @@ def interp3_oblique(X, Y, Z, V, M, Vx, Vy, Vz):
 
 
 class RSM:
-    def __init__(self, det_data, energy, delta, gamma, num_angle, th_step, pix, det_dist, offset):
+    def __init__(self, det_data, energy, delta, gamma, num_angle, th_step, pix, det_dist, offset, fluo_stack=None, fluo_names=None):
         # input det_data [angle,position, det_row,det_col]
         # output rsm [position,q_y,q_x,q_z]
         self.energy = energy
@@ -618,7 +619,8 @@ class RSM:
         self.offset = offset
         self.det_data = det_data
         self.k = 1e4 / (12.398/energy)
-
+        self.fluo_stack = fluo_stack
+        self.fluo_names = fluo_names
     def calcRSM(self, coor, data_store='reduced', desired_workers=10):
     
         '''
@@ -733,6 +735,7 @@ class RSM:
         # --- Optionally reshape and clean up data after processing ---
         if data_store != 'full':
             del self.det_data
+            gc.collect()
             # The reshaping below reintroduces any higher-order dimensions from the
             # original detector data array.
             self.qxz_data = np.reshape(self.qxz_data,
@@ -750,6 +753,7 @@ class RSM:
             print("full_data: 3D rsm, [pos,qy,qx,qz] with dimensions of {}"
                   .format(self.full_data.shape))
         self.data_store = data_store
+        
 
     def calcSTRAIN(self, method):
         # ... (remaining part of calcSTRAIN unchanged) ...
@@ -762,29 +766,83 @@ class RSM:
             qx_pos = np.sum(self.qxz_data, -1)
             qy_pos = np.sum(self.qyz_data, -1)
         sz = np.shape(qz_pos)
-        if np.size(sz) == 3:
-            shift_qz = np.zeros((sz[0], sz[1]))
-            shift_qx = np.zeros((sz[0], sz[1]))
-            shift_qy = np.zeros((sz[0], sz[1]))
-            for i in tqdm(range(sz[0])):
-                for j in range(sz[1]):
-                    if method == 'com':
-                        shift_qz[i, j] = cen_of_mass(qz_pos[i, j, :])
-                        shift_qy[i, j] = cen_of_mass(qy_pos[i, j, :])
-                        shift_qx[i, j] = cen_of_mass(qx_pos[i, j, :])
-        elif np.size(sz) == 2:
-            shift_qz = np.zeros((sz[0]))
-            shift_qx = np.zeros((sz[0]))
-            shift_qy = np.zeros((sz[0]))
-            for i in tqdm(range(sz[0])):
-                if method == 'com':
-                    shift_qz[i] = cen_of_mass(qz_pos[i, :])
-                    shift_qy[i] = cen_of_mass(qy_pos[i, :])
-                    shift_qx[i] = cen_of_mass(qx_pos[i, :])
-        self.strain = -shift_qz * (self.zq[0, 0, 1] - self.zq[0, 0, 0]) / np.linalg.norm(self.h)
-        self.tilt_x = shift_qx * (self.xq[0, 1, 0] - self.xq[0, 0, 0]) / np.linalg.norm(self.h)
-        self.tilt_y = shift_qy * (self.yq[1, 0, 0] - self.yq[0, 0, 0]) / np.linalg.norm(self.h)
-        self.tot = np.sum(qz_pos, -1) 
+        qz_pos = np.reshape(qz_pos, (-1,qz_pos.shape[-1]))
+        qy_pos = np.reshape(qy_pos, (-1,qy_pos.shape[-1]))
+        qx_pos = np.reshape(qx_pos, (-1,qx_pos.shape[-1]))
+
+        
+
+        if method['fit_type'] == 'com':   
+            shift_qz = np.zeros(qz_pos.shape[0])
+            shift_qy = np.zeros(qy_pos.shape[0])
+            shift_qx = np.zeros(qx_pos.shape[0])
+            for i in tqdm(range(qz_pos.shape[0])):
+                shift_qz[i] = cen_of_mass(qz_pos[i,:])
+                shift_qy[i] = cen_of_mass(qy_pos[i,:])
+                shift_qx[i] = cen_of_mass(qx_pos[i,:])
+            self.strain = -shift_qz * (self.zq[0, 0, 1] - self.zq[0, 0, 0]) / np.linalg.norm(self.h)
+            self.tilt_x = shift_qx * (self.xq[0, 1, 0] - self.xq[0, 0, 0]) / np.linalg.norm(self.h)
+            self.tilt_y = shift_qy * (self.yq[1, 0, 0] - self.yq[0, 0, 0]) / np.linalg.norm(self.h)
+            self.tot = np.sum(qz_pos, -1)
+            self.strain = np.reshape(self.strain, sz[:-1])
+            self.tilt_x = np.reshape(self.tilt_x, sz[:-1])
+            self.tilt_y = np.reshape(self.tilt_y, sz[:-1])
+            self.tot = np.reshape(self.tot, sz[:-1])
+        elif method['fit_type'] == 'peak':
+            peak = method['shape']
+            n_peaks = method['n_peaks']
+            shift_qz = np.zeros((qz_pos.shape[0],n_peaks[2]))
+            shift_qy = np.zeros((qy_pos.shape[0],n_peaks[1]))
+            shift_qx = np.zeros((qx_pos.shape[0],n_peaks[0]))
+            x = self.xq[0,:,0]
+            y = self.yq[:,0,0]
+            z = self.zq[0,0,:]
+            for i in tqdm(range(qz_pos.shape[0])):
+                
+                x_param,_ = fit_peaks(x, qx_pos[i,:],peak,n_peaks[0])
+                y_param,_ = fit_peaks(y, qy_pos[i,:],peak,n_peaks[1])
+                z_param,_ = fit_peaks(z, qz_pos[i,:],peak,n_peaks[2])
+
+                if peak == 'voigt':
+                    shift_qx[i,:] = [x_param[j] for j in range(2,4*n_peaks[0],4)]
+                    shift_qy[i,:] = [y_param[j] for j in range(2,4*n_peaks[1],4)]
+                    shift_qz[i,:] = [z_param[j] for j in range(2,4*n_peaks[2],4)]
+                else:
+                    shift_qx[i,:] = [x_param[j] for j in range(2,3*n_peaks[0],3)]
+                    shift_qy[i,:] = [y_param[j] for j in range(2,3*n_peaks[1],3)]
+                    shift_qz[i,:] = [z_param[j] for j in range(2,3*n_peaks[2],3)]
+            self.strain = -shift_qz/np.linalg.norm(self.h)
+            self.tilt_x = shift_qx / np.linalg.norm(self.h)
+            self.tilt_y = shift_qy / np.linalg.norm(self.h)
+            self.tot = np.sum(qz_pos, -1)
+            self.strain = np.reshape(self.strain, (sz[:-1]+(n_peaks[2],)))
+            self.tilt_x = np.reshape(self.tilt_x, (sz[:-1]+(n_peaks[0],)))
+            self.tilt_y = np.reshape(self.tilt_y, (sz[:-1]+(n_peaks[1],)))
+            self.tot = np.reshape(self.tot, sz[:-1])
+
+        # if np.size(sz) == 3:
+        #     shift_qz = np.zeros((sz[0], sz[1]))
+        #     shift_qx = np.zeros((sz[0], sz[1]))
+        #     shift_qy = np.zeros((sz[0], sz[1]))
+        #     for i in tqdm(range(sz[0])):
+        #         for j in range(sz[1]):
+        #             if method['fit_type'] == 'com':
+        #                 shift_qz[i, j] = cen_of_mass(qz_pos[i, j, :])
+        #                 shift_qy[i, j] = cen_of_mass(qy_pos[i, j, :])
+        #                 shift_qx[i, j] = cen_of_mass(qx_pos[i, j, :])
+        # elif np.size(sz) == 2:
+        #     shift_qz = np.zeros((sz[0]))
+        #     shift_qx = np.zeros((sz[0]))
+        #     shift_qy = np.zeros((sz[0]))
+        #     for i in tqdm(range(sz[0])):
+        #         if method['fit_type'] == 'com':
+        #             shift_qz[i] = cen_of_mass(qz_pos[i, :])
+        #             shift_qy[i] = cen_of_mass(qy_pos[i, :])
+        #             shift_qx[i] = cen_of_mass(qx_pos[i, :])
+        # self.strain = -shift_qz * (self.zq[0, 0, 1] - self.zq[0, 0, 0]) / np.linalg.norm(self.h)
+        # self.tilt_x = shift_qx * (self.xq[0, 1, 0] - self.xq[0, 0, 0]) / np.linalg.norm(self.h)
+        # self.tilt_y = shift_qy * (self.yq[1, 0, 0] - self.yq[0, 0, 0]) / np.linalg.norm(self.h)
+        # self.tot = np.sum(qz_pos, -1) 
     def disp(self):
         
         fig = plt.figure(1)
@@ -849,6 +907,8 @@ class RSM:
             ax.set_xlabel('x')
             ax.set_ylabel('tilt_y (degree)')
         plt.tight_layout()
+        plt.show(block=False)
+
         #plt.savefig('./result.png')
               
     def save(self,output_path):
@@ -897,8 +957,17 @@ class RSM:
             file_name = ''.join([output_path,'results.png'])
             plt.savefig(file_name)
 
-
-
+    def run_interactive(self):
+        ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
+        ims = np.stack(ims,axis=0)
+        im_stack = np.concatenate((self.fluo_stack,ims),axis = 0)
+        names = self.fluo_names + ['tot','strain','tilt_x','tilt_y']
+        if self.data_store == 'full':
+            disp_data = np.swapaxes(np.sum(self.full_data,-2),-1,-2)
+        else:
+            disp_data = np.swapaxes(self.qxz_data,-1,-2)
+        interactive_map(names,im_stack,'qx vs qz',disp_data)
+        return
 
 
 def cen_of_mass(c):
@@ -979,6 +1048,7 @@ def interactive_map(
     im = diff_ax.imshow(data_4D[0, 0], cmap=cmap, clim=clim, aspect='auto')
     diff_ax.set_title(label, fontsize=9)
     diff_ax.axis('off')
+    plt.show(block=False)
 
     for ax in axs[total:]:
         ax.axis('off')
@@ -1015,36 +1085,6 @@ def interactive_map(
     fig.canvas.mpl_connect('button_press_event', onclick)
 
     fig.show()
-
-def load_diff_data(sid,scaler_names,det_name, mon = None):
-    h = db[sid]
-    df = h.table()
-    s = scan_command(sid)
-    x_mot = s.split()[0]
-    y_mot = s.split()[4]
-    scan_col = int (s.split()[3])
-    scan_row = int (s.split()[7])
-    diff_data = list(h.data(det_name))
-    im_stack = []
-    print(f'row = {scan_row} col = {scan_col}')
-    for name in scaler_names:
-
-        if name in df:
-            tmp = df[name]
-        else:
-            tmp = (df['Det1_{}'.format(name)] + df['Det2_{}'.format(name)] + df['Det3_{}'.format(name)])
-        #print(np.shape(tmp))
-        tmp = np.reshape(np.asarray(tmp),(1,scan_row, scan_col))
-
-        if len(im_stack) == 0 :
-            im_stack = tmp
-        else:
-            im_stack = np.concatenate([im_stack,tmp],axis=0)
-    if mon is not None:
-        mon_var = df[mon]
-        im_stack = im_stack/np.expand_dims(mon_var,0)
-    sz = np.shape(diff_data)
-    return im_stack, np.reshape(diff_data,(scan_row,scan_col,sz[2],sz[3]))
 
 def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',color='white'):
     # desc: a dictionary. Example,
@@ -1134,6 +1174,7 @@ def sort_files_by_creation_time(file_list):
     return sorted(file_list, key=lambda file: get_file_creation_time(file))
 
 def block_mask(data, pos1, pos2, axes_swap=True,region = 0):
+    # define a line specified by pos1 and pos2, set either the bottom part to be zero, region = 0, or the upper part, region = 1
     sz = np.shape(data)
     data_new = np.reshape(data,[-1,sz[-2],sz[-1]])
     sz_new = np.shape(data_new)
@@ -1172,3 +1213,78 @@ def block_mask(data, pos1, pos2, axes_swap=True,region = 0):
     else:
         data_new = np.reshape(data_new,sz)
     return data_new
+
+# Define peak shapes
+def gaussian(x, A, x0, sigma):
+    return A * np.exp(-(x - x0)**2 / (2 * sigma**2))
+
+def lorentzian(x, A, x0, gamma):
+    return A * gamma**2 / ((x - x0)**2 + gamma**2)
+
+def voigt(x, A, x0, sigma, gamma):
+    z = ((x - x0) + 1j*gamma) / (sigma * np.sqrt(2))
+    return A * np.real(wofz(z)) / (sigma * np.sqrt(2*np.pi))
+
+# General fitting function for N peaks
+def build_model(x, peak_type, n_peaks):
+    def model(x, *params):
+        y = np.zeros_like(x)
+        for i in range(n_peaks):
+            offset = i * shape_param_count[peak_type]
+            p = params[offset : offset + shape_param_count[peak_type]]
+            y += peak_funcs[peak_type](x, *p)
+        return y
+    return model
+
+# Parameter counts per peak shape
+shape_param_count = {
+    'gaussian': 3,
+    'lorentzian': 3,
+    'voigt': 4
+}
+
+# Mapping of shape to function
+peak_funcs = {
+    'gaussian': gaussian,
+    'lorentzian': lorentzian,
+    'voigt': voigt
+}
+
+def fit_peaks(x, y, peak_type='gaussian', n_peaks=1, p0=None, bounds=(-np.inf, np.inf)):
+    """
+    Fits single or multiple peaks using specified shape.
+
+    Parameters:
+        x (array): x-data
+        y (array): y-data
+        peak_type (str): 'gaussian', 'lorentzian', or 'voigt'
+        n_peaks (int): number of peaks to fit
+        p0 (list or None): initial parameter guess [A1, x01, sigma1, A2, x02, sigma2, ...]
+        bounds (2-tuple): (lower_bounds, upper_bounds)
+
+    Returns:
+        popt: fitted parameters
+        fit_y: fitted curve
+    """
+    if peak_type not in peak_funcs:
+        raise ValueError(f"Unsupported peak_type '{peak_type}'")
+
+    model = build_model(x, peak_type, n_peaks)
+
+    if p0 is None:
+        # Default guess: equally spaced peaks
+        step = (x[-1] - x[0]) / (n_peaks + 1)
+        p0 = []
+        for i in range(n_peaks):
+            A_guess = max(y)
+            x0_guess = x[0] + (i+1) * step
+            sigma_guess = (x[-1] - x[0]) / 10
+            if peak_type == 'voigt':
+                gamma_guess = sigma_guess / 2
+                p0.extend([A_guess, x0_guess, sigma_guess, gamma_guess])
+            else:
+                p0.extend([A_guess, x0_guess, sigma_guess])
+
+    popt, _ = curve_fit(model, x, y, p0=p0, bounds=bounds)
+    fit_y = model(x, *popt)
+    return popt, fit_y
