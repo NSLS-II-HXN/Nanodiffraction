@@ -1,6 +1,7 @@
 import numpy as np
 from pystackreg import StackReg
 import matplotlib.pyplot as plt
+from matplotlib.widgets import RectangleSelector
 import matplotlib.animation as manimation
 import tifffile
 import h5py
@@ -770,8 +771,6 @@ class RSM:
         qy_pos = np.reshape(qy_pos, (-1,qy_pos.shape[-1]))
         qx_pos = np.reshape(qx_pos, (-1,qx_pos.shape[-1]))
 
-        
-
         if method['fit_type'] == 'com':   
             shift_qz = np.zeros(qz_pos.shape[0])
             shift_qy = np.zeros(qy_pos.shape[0])
@@ -804,13 +803,13 @@ class RSM:
                 z_param,_ = fit_peaks(z, qz_pos[i,:],peak,n_peaks[2])
 
                 if peak == 'voigt':
-                    shift_qx[i,:] = [x_param[j] for j in range(2,4*n_peaks[0],4)]
-                    shift_qy[i,:] = [y_param[j] for j in range(2,4*n_peaks[1],4)]
-                    shift_qz[i,:] = [z_param[j] for j in range(2,4*n_peaks[2],4)]
+                    shift_qx[i,:] = [x_param[j] for j in range(1,4*n_peaks[0],4)]
+                    shift_qy[i,:] = [y_param[j] for j in range(1,4*n_peaks[1],4)]
+                    shift_qz[i,:] = [z_param[j] for j in range(1,4*n_peaks[2],4)]
                 else:
-                    shift_qx[i,:] = [x_param[j] for j in range(2,3*n_peaks[0],3)]
-                    shift_qy[i,:] = [y_param[j] for j in range(2,3*n_peaks[1],3)]
-                    shift_qz[i,:] = [z_param[j] for j in range(2,3*n_peaks[2],3)]
+                    shift_qx[i,:] = [x_param[j] for j in range(1,3*n_peaks[0],3)]
+                    shift_qy[i,:] = [y_param[j] for j in range(1,3*n_peaks[1],3)]
+                    shift_qz[i,:] = [z_param[j] for j in range(1,3*n_peaks[2],3)]
             self.strain = -shift_qz/np.linalg.norm(self.h)
             self.tilt_x = shift_qx / np.linalg.norm(self.h)
             self.tilt_y = shift_qy / np.linalg.norm(self.h)
@@ -819,6 +818,11 @@ class RSM:
             self.tilt_x = np.reshape(self.tilt_x, (sz[:-1]+(n_peaks[0],)))
             self.tilt_y = np.reshape(self.tilt_y, (sz[:-1]+(n_peaks[1],)))
             self.tot = np.reshape(self.tot, sz[:-1])
+
+            # move peaks to the first axis
+            self.strain = np.squeeze(np.moveaxis(self.strain, -1, 0))
+            self.tilt_x = np.squeeze(np.moveaxis(self.tilt_x, -1, 0))
+            self.tilt_y = np.squeeze(np.moveaxis(self.tilt_y, -1, 0))
 
         # if np.size(sz) == 3:
         #     shift_qz = np.zeros((sz[0], sz[1]))
@@ -963,10 +967,11 @@ class RSM:
         im_stack = np.concatenate((self.fluo_stack,ims),axis = 0)
         names = self.fluo_names + ['tot','strain','tilt_x','tilt_y']
         if self.data_store == 'full':
-            disp_data = np.swapaxes(np.sum(self.full_data,-2),-1,-2)
+            disp_data = [np.swapaxes(np.sum(self.full_data,-3),-1,-2),np.swapaxes(np.sum(self.full_data,-2),-1,-2)]
+            
         else:
-            disp_data = np.swapaxes(self.qxz_data,-1,-2)
-        interactive_map(names,im_stack,'qx vs qz',disp_data)
+            disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
+        interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data)
         return
 
 
@@ -981,7 +986,7 @@ def cen_of_mass(c):
         if a > tot/2:
             idx = i - (a-tot/2)/c[i]
             break
-    return idx
+    return idx-n//2
 def rsm_cen_x_y(data):
     sz = np.shape(data)
     new_data = np.zeros(data.shape,dtype=data.dtype)
@@ -1028,7 +1033,9 @@ def interactive_map(
     marker_color='black'
 ):
     n = min(len(names), im_stack.shape[0])
-    total = n + 1
+    m = min(len(label),len(data_4D))
+
+    total = n + m
     ncols, nrows = 3, int(np.ceil(total / 3))
 
     fig, axs = plt.subplots(
@@ -1039,16 +1046,17 @@ def interactive_map(
     axs = axs.ravel()
 
     # initial plotting
+    
     for ax, name, img in zip(axs, names[:n], im_stack[:n]):
         ax.imshow(img, cmap=cmap, aspect='auto')
         ax.set_title(name, fontsize=9)
         ax.axis('off')
-
-    diff_ax = axs[n]
-    im = diff_ax.imshow(data_4D[0, 0], cmap=cmap, clim=clim, aspect='auto')
-    diff_ax.set_title(label, fontsize=9)
-    diff_ax.axis('off')
-    plt.show(block=False)
+    for i in range(m):
+        diff_ax = axs[n+i]
+        im = diff_ax.imshow(data_4D[i][0, 0], cmap=cmap, clim=clim, aspect='auto')
+        diff_ax.set_title(label, fontsize=9)
+        diff_ax.axis('off')
+        plt.show(block=False)
 
     for ax in axs[total:]:
         ax.axis('off')
@@ -1074,8 +1082,9 @@ def interactive_map(
                 ax.plot(col, row, 'o', color=marker_color, ms=5)
                 ax.set_title(names[i], fontsize=9)
             else:
-                ax.imshow(data_4D[row, col], cmap=cmap, clim=clim, aspect='auto')
-                ax.set_title(label, fontsize=9)
+                j = i - n
+                ax.imshow(data_4D[j][row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.set_title(label[j], fontsize=9)
             ax.axis('off')
 
         # immediate redraw
@@ -1288,3 +1297,47 @@ def fit_peaks(x, y, peak_type='gaussian', n_peaks=1, p0=None, bounds=(-np.inf, n
     popt, _ = curve_fit(model, x, y, p0=p0, bounds=bounds)
     fit_y = model(x, *popt)
     return popt, fit_y
+
+def select_roi(image):
+    """
+    Display an image and allow user to draw a rectangle to select ROI.
+    
+    Parameters:
+        image (ndarray): 2D image array
+
+    Returns:
+        roi (list): [row_start, col_start, row_width, col_width]
+                    or None if no selection was made.
+    """
+    roi_holder = {}
+
+    def on_select(eclick, erelease):
+        x1, y1 = int(eclick.xdata), int(eclick.ydata)
+        x2, y2 = int(erelease.xdata), int(erelease.ydata)
+
+        row_start = min(y1, y2)
+        col_start = min(x1, x2)
+        row_width = abs(y2 - y1)
+        col_width = abs(x2 - x1)
+
+        roi_holder['roi'] = [row_start, col_start, row_width, col_width]
+        print("Selected ROI:", roi_holder['roi'])
+        
+    fig, ax = plt.subplots()
+    ax.imshow(image, cmap='jet')
+    ax.set_title("Draw a rectangle to select ROI, then close the window")
+
+    selector = RectangleSelector(
+        ax,
+        on_select,
+        useblit=True,
+        button=[1],  # Left mouse button
+        minspanx=5,
+        minspany=5,
+        spancoords='pixels',
+        interactive=True
+    )
+
+    plt.show()  # Waits for user interaction and window close
+
+    return roi_holder.get('roi', None)
