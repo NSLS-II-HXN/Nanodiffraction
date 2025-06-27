@@ -267,7 +267,7 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None):
     sid = int(sid)
     file_names = sort_files_by_creation_time(get_path(sid, det))
     data_name = '/entry/instrument/detector/data'
-
+   
     data_blocks = []
 
     for fname in file_names:
@@ -636,7 +636,7 @@ class RSM:
         
         # --- Standard computations to set up matrices and grids ---
         sz = np.shape(self.det_data)
-        data_type = self.det_data.dtype
+        data_type = np.float32
         det_row = sz[-2]
         det_col = sz[-1]
         Mx = np.matrix([[1., 0., 0.],
@@ -656,9 +656,9 @@ class RSM:
         kz_lab = M_D2L @ kz
         M_O2L = np.concatenate([kx_lab, ky_lab, kz_lab], axis=1)
         M_L2O = np.linalg.inv(M_O2L)
-        x_rng = np.linspace(1 - round(det_col/2), det_col - round(det_col/2), det_col)
-        y_rng = np.linspace(1 - round(det_row/2), det_row - round(det_row/2), det_row)
-        z_rng = np.linspace(1 - round(self.num_angle/2), self.num_angle - round(self.num_angle/2), self.num_angle)
+        x_rng = np.linspace(1 - round(det_col/2), det_col - round(det_col/2), det_col, dtype=data_type)
+        y_rng = np.linspace(1 - round(det_row/2), det_row - round(det_row/2), det_row,dtype=data_type)
+        z_rng = np.linspace(1 - round(self.num_angle/2), self.num_angle - round(self.num_angle/2), self.num_angle,dtype=data_type)
         X, Y, Z = np.meshgrid(x_rng, y_rng, z_rng)
         X = X + self.offset[1]
         Y = Y + self.offset[0]
@@ -691,6 +691,7 @@ class RSM:
             return
 
         self.coor = coor
+        M = np.asarray(M, dtype=data_type)
         pix_sz, xq, yq, zq = create_grid(X, Y, Z, M)
         trans_sz = np.shape(xq)
 
@@ -762,6 +763,7 @@ class RSM:
 
     def calcSTRAIN(self, method):
         # ... (remaining part of calcSTRAIN unchanged) ...
+
         if self.data_store == 'full':
             qz_pos = np.sum(np.sum(self.full_data, -2), -2)
             qx_pos = np.sum(np.sum(self.full_data, -1), -2)
@@ -827,6 +829,31 @@ class RSM:
             self.strain = np.squeeze(np.moveaxis(self.strain, -1, 0))
             self.tilt_x = np.squeeze(np.moveaxis(self.tilt_x, -1, 0))
             self.tilt_y = np.squeeze(np.moveaxis(self.tilt_y, -1, 0))
+
+
+        if method['mask'] is not None:
+            ref_name = method['mask']
+            mask = np.zeros_like(self.fluo_stack[0])
+            threshold = method['mask threshold']
+            if ref_name == 'tot':
+                maxV = np.max(self.tot)
+                mask[self.tot > threshold*maxV] = 1
+            else:
+                ref_im = self.fluo_stack[np.argwhere(self.fluo_names == 'ref_name')]
+                maxV = np.max(ref_im)
+                mask[ref_im > threshold*maxV] = 1
+            if self.strain.ndim == 3: 
+                self.strain *= mask[np.newaxis,:,:]
+            else:
+                self.strain *= mask
+            if self.tilt_x.ndim == 3: 
+                self.tilt_x *= mask[np.newaxis,:,:]
+            else:
+                self.tilt_x *= mask    
+            if self.tilt_y.ndim == 3: 
+                self.tilt_y *= mask[np.newaxis,:,:]
+            else:
+                self.tilt_y *= mask
 
         # if np.size(sz) == 3:
         #     shift_qz = np.zeros((sz[0], sz[1]))
@@ -1299,11 +1326,14 @@ def fit_peaks(x, y, peak_type='gaussian', n_peaks=1, p0=None, bounds=(-np.inf, n
                 p0.extend([A_guess, x0_guess, sigma_guess, gamma_guess])
             else:
                 p0.extend([A_guess, x0_guess, sigma_guess])
-
-    popt, _ = curve_fit(model, x, y, p0=p0, bounds=bounds)
-    fit_y = model(x, *popt)
-    return popt, fit_y
-
+    try:
+        popt, _ = curve_fit(model, x, y, p0=p0, bounds=bounds,maxfev=5000)
+        fit_y = model(x, *popt)
+        return popt, fit_y
+    except Exception as e:
+        print(f"Fit failed: {e}")
+        return np.full_like(p0,np.nan), np.full_like(y, np.nan)
+    
 def select_roi(image):
     """
     Display an image and allow user to draw a rectangle to select ROI.
@@ -1371,7 +1401,7 @@ def slider_view(im_stack):
 
     slider.on_changed(update)
 
-    plt.show(block=False)
+    plt.show()
 
 def load_json_file():
     # Create a hidden Tkinter root window
