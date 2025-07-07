@@ -24,6 +24,9 @@ import gc
 import json
 import tkinter as tk
 from tkinter import filedialog
+import warnings
+import pandas as pd
+import json
 
 def get_sid_list(str_list, interval):
     num_elem = np.size(str_list)
@@ -762,8 +765,9 @@ class RSM:
         
 
     def calcSTRAIN(self, method):
-        # ... (remaining part of calcSTRAIN unchanged) ...
+        # calculate lattice strain and tilting angles based on method selected
 
+        self.method = method
         if self.data_store == 'full':
             qz_pos = np.sum(np.sum(self.full_data, -2), -2)
             qx_pos = np.sum(np.sum(self.full_data, -1), -2)
@@ -880,7 +884,7 @@ class RSM:
         # self.tot = np.sum(qz_pos, -1) 
     def disp(self):
         
-        fig = plt.figure(1)
+        fig = plt.figure()
         fig.set_size_inches(8, 6)
         fig.set_dpi(160)
         
@@ -1428,3 +1432,73 @@ def load_json_file():
     except Exception as e:
         print(f"Error loading JSON file: {e}")
         return None
+    
+def get_baseline_fields(run, field_list):
+    """
+    Extract baseline fields from a Bluesky run using DataBroker v1, suppressing pandas fragmentation warnings.
+    """
+    try:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore", category=pd.errors.PerformanceWarning)
+
+            df = run.table(stream_name='baseline')
+
+        if df.empty:
+            print("Baseline stream exists but has no data.")
+            return {}
+
+        first_row = df.iloc[0]
+        result = {}
+        for field in field_list:
+            if field in first_row:
+                result[field] = first_row[field]
+            else:
+                print(f"Field '{field}' not found in baseline.")
+        return result
+
+    except Exception as e:
+        print(f"Error accessing baseline: {e}")
+        return {}
+
+def read_params_db(sid_list,microscope='mll',det='merlin1'):
+    
+    det_param = {'merlin1':55, "merlin2":55, "eiger2_images":75}
+    num_scans = len(sid_list)
+    if microscope == 'mll':
+        th_name = 'dsth'
+    elif microscope =='zp':
+        th_name = 'zpsth'
+    else:
+        print('microscope name needs to be either mll or zp')
+    
+    keys = ['energy','diff_gamma','diff_delta','diff_r']
+    values = get_baseline_fields(db[sid_list[0]],keys)
+
+    th_step = get_baseline_fields(db[sid_list[1]],[th_name])[th_name] - get_baseline_fields(db[sid_list[0]],[th_name])[th_name]
+
+    if th_step == 0:
+        print(f"{th_name} doesn't change over scans.Switch to another microscope for correct theta stage")
+
+    det_pix = det_param[det]
+
+    params={"number of angles":num_scans,
+            "angle step":th_step,
+            "detector name": det,
+            "energy": values['energy'],
+            "gamma": values['diff_gamma'],
+            "delta": values['diff_delta'],
+            "detector distance": values['diff_r']*1000,
+            "pixel size": det_pix
+            }
+    
+    return params
+
+def convert_numpy(obj):
+    if isinstance(obj, np.ndarray):
+        return obj.tolist()
+    elif isinstance(obj, dict):
+        return {k: convert_numpy(v) for k, v in obj.items()}
+    elif isinstance(obj, list):
+        return [convert_numpy(i) for i in obj]
+    else:
+        return obj
