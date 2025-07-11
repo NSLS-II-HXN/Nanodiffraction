@@ -130,6 +130,21 @@ def align_im_stack(im_stack):
     trans_matrix = np.column_stack([-b,-a])
     return out, trans_matrix
 
+def align_im_stack_v1(im_stack, method='TRANSLATION', ref='previous'):
+    # default stacking axis is zero
+    if method == 'TRANSLATION':
+        sr = StackReg(StackReg.TRANSLATION)
+    elif method == 'RIGID_BODY':
+        sr = StackReg(StackReg.RIGID_BODY)
+    elif method == 'AFFINE':
+        sr = StackReg(StackReg.AFFINE)
+
+    #sr = StackReg(StackReg.RIGID_BODY)
+    tmats = sr.register_stack(im_stack, reference=ref)
+    out = sr.transform_stack(im_stack)
+    return out, tmats
+
+
 
 def load_h5_data(file_list, roi, mask):
     # load a list of scans, with data being stacked at the first axis
@@ -494,6 +509,84 @@ def process_5d(subset, shift_matrix, index):
     return (1 - rx) * (1 - ry) * lxly_subset + rx * (1 - ry) * hxly_subset + (1 - rx) * ry * lxhy_subset + rx * ry * hxhy_subset
 
 
+def process_3d_v1(subset, tmat, index):
+    i = index
+    t = tmat[i,0:2,0:2]
+    u = tmat[i,0:2,2].reshape(2,1) 
+    # inv_t = np.linalg.inv(t)
+    sz = np.shape(subset)
+    x, y = np.meshgrid(np.linspace(0,sz[1],sz[1],False),np.linspace(0,sz[0],sz[0],False))
+    p = np.stack([x.ravel(),y.ravel()],0)
+    p = p + u
+    trans_p = t@p
+    trans_x = np.reshape(trans_p[0,:],x.shape)
+    trans_y = np.reshape(trans_p[1,:],y.shape)
+
+    ly = np.clip(np.floor(trans_y),0,sz[0]-1).astype(int)
+    hy = np.clip(np.ceil(trans_y),0,sz[0]-1).astype(int)
+    lx = np.clip(np.floor(trans_x),0,sz[1]-1).astype(int)
+    hx = np.clip(np.ceil(trans_x),0,sz[1]-1).astype(int)
+    lxly_subset = subset[ly,lx]
+    lxhy_subset = subset[hy,lx]
+    hxly_subset = subset[ly,hx]
+    hxhy_subset = subset[hy,hx]
+    ry = trans_y - ly
+    rx = trans_x - lx
+    return (1 - rx) * (1 - ry) * lxly_subset + rx * (1 - ry) * hxly_subset + (1 - rx) * ry * lxhy_subset + rx * ry * hxhy_subset
+
+def process_4d_v1(subset, tmat, index):
+    i = index
+    t = tmat[i,0,0]
+    u = tmat[i,0,1]
+    # inv_t = np.linalg.inv(t)
+    sz = np.shape(subset)
+    x = np.linspace(0,sz[0],sz[0],False)
+    
+    p = p + u
+    trans_x = t*p
+    
+    lx = np.clip(np.floor(trans_x),0,sz[1]-1).astype(int)
+    hx = np.clip(np.ceil(trans_x),0,sz[1]-1).astype(int)
+    lx_subset = subset[lx]
+    hx_subset = subset[hx]
+     
+    rx = trans_x - lx
+     
+    return (1 - rx) * lx_subset + rx * hx_subset 
+
+
+def process_5d_v1(subset, tmat, index):
+    i = index
+    t = tmat[i,0:2,0:2]
+    u = tmat[i,0:2,2].reshape(2,1)
+    # inv_t = np.linalg.inv(t)
+    sz = np.shape(subset)
+    
+    x, y = np.meshgrid(np.linspace(0,sz[1],sz[1],False),np.linspace(0,sz[0],sz[0],False))
+    p = np.stack([x.ravel(),y.ravel()],0)
+    p = p + u
+    trans_p = t@p
+    trans_x = np.reshape(trans_p[0,:],x.shape)
+    trans_y = np.reshape(trans_p[1,:],y.shape)
+
+    ly = np.clip(np.floor(trans_y),0,sz[0]-1).astype(int)
+    hy = np.clip(np.ceil(trans_y),0,sz[0]-1).astype(int)
+    lx = np.clip(np.floor(trans_x),0,sz[1]-1).astype(int)
+    hx = np.clip(np.ceil(trans_x),0,sz[1]-1).astype(int)
+    lxly_subset = subset[ly,lx,:,:]
+    lxhy_subset = subset[hy,lx,:,:]
+    hxly_subset = subset[ly,hx,:,:]
+    hxhy_subset = subset[hy,hx,:,:]
+    ry = trans_y - ly
+    rx = trans_x - lx
+    v00 = (1 - rx) * (1 - ry)
+    v10 = rx * (1 - ry)
+    v01 = (1 - rx) * ry 
+    v11 = rx * ry 
+
+    return v00[:,:,np.newaxis,np.newaxis] * lxly_subset + v10[:,:,np.newaxis,np.newaxis] * hxly_subset \
+        + v01[:,:,np.newaxis,np.newaxis] * lxhy_subset + v11[:,:,np.newaxis,np.newaxis] * hxhy_subset
+
 def interp_sub_pix(data, shift_matrix, max_workers = 10):
     '''
     Parallelized function to apply sub-pixel shifts to 3D, 4D, or 5D data.
@@ -531,6 +624,42 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     
     return data
 
+def interp_sub_pix_v1(data, tmat, max_workers = 10):
+    '''
+    Parallelized function to apply sub-pixel shifts to 3D, 4D, or 5D data.
+
+    Parameters:
+        data (ndarray): Input data of shape (N, ...) where N is the first axis.
+        shift_matrix (ndarray): Shift values corresponding to each slice.
+        max_workers (int): Number of parallel workers (default: 8).
+
+    Returns:
+        ndarray: Shifted data of the same shape as input.
+    '''
+    sz = np.shape(data)
+    sz_len = np.size(sz)
+    # results = np.zeros_like(data)
+    process_func = None
+    if sz_len == 3:
+        process_func = process_3d_v1
+    elif sz_len == 4:
+        process_func = process_4d_v1
+    elif sz_len == 5:
+        process_func = process_5d_v1
+    else:
+        raise ValueError('Dimension of the data must be 3D, 4D, or 5D.')
+    
+    available_cores = os.cpu_count() or 1
+    max_workers = min(max_workers, available_cores)
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        # Submit a task for each slice
+        futures = {executor.submit(process_func, subset, tmat, index): index for index, subset in enumerate(data)}
+
+        for future in tqdm(as_completed(futures), total=sz[0], desc="Parallel interp_sub_pix"):
+            idx = futures[future]
+            data[idx] = future.result()
+    
+    return data
 
 def trans_coor3D(X, Y, Z, M):
     '''Transform coordinates (X,Y,Z) by 3x3 matrix M (e.g., rotation/transform).'''
@@ -843,7 +972,7 @@ class RSM:
                 maxV = np.max(self.tot)
                 mask[self.tot > threshold*maxV] = 1
             else:
-                ref_im = self.fluo_stack[np.argwhere(self.fluo_names == 'ref_name')]
+                ref_im = self.fluo_stack[self.fluo_names.index(ref_name)]
                 maxV = np.max(ref_im)
                 mask[ref_im > threshold*maxV] = 1
             if self.strain.ndim == 3: 
@@ -968,33 +1097,35 @@ class RSM:
         file_name = ''.join([output_path,'tilt_y_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.tilt_y,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'pos_rsm_xz.obj'])
-        if self.data_store == 'full':
-            pickle.dump(np.sum(self.full_data,-3),open(file_name,'wb'), protocol = 4)
-        else:
-            pickle.dump(self.qxz_data,open(file_name,'wb'), protocol = 4)
+        # file_name = ''.join([output_path,'pos_rsm_xz.obj'])
+        # if self.data_store == 'full':
+        #     pickle.dump(np.sum(self.full_data,-3),open(file_name,'wb'), protocol = 4)
+        # else:
+        #     pickle.dump(self.qxz_data,open(file_name,'wb'), protocol = 4)
 
-        file_name = ''.join([output_path,'pos_rsm_yz.obj'])
-        if self.data_store == 'full':
-            pickle.dump(np.sum(self.full_data,-2),open(file_name,'wb'),protocol = 4)
-        else:
-            pickle.dump(self.qyz_data,open(file_name,'wb'),protocol = 4)
+        # file_name = ''.join([output_path,'pos_rsm_yz.obj'])
+        # if self.data_store == 'full':
+        #     pickle.dump(np.sum(self.full_data,-2),open(file_name,'wb'),protocol = 4)
+        # else:
+        #     pickle.dump(self.qyz_data,open(file_name,'wb'),protocol = 4)
 
-        file_name = ''.join([output_path,'xq.obj'])
-        pickle.dump(self.xq,open(file_name,'wb'),protocol = 4)
+        # file_name = ''.join([output_path,'xq.obj'])
+        # pickle.dump(self.xq,open(file_name,'wb'),protocol = 4)
 
-        file_name = ''.join([output_path,'yq.obj'])
-        pickle.dump(self.yq,open(file_name,'wb'),protocol = 4)
+        # file_name = ''.join([output_path,'yq.obj'])
+        # pickle.dump(self.yq,open(file_name,'wb'),protocol = 4)
 
-        file_name = ''.join([output_path,'zq.obj'])
-        pickle.dump(self.zq,open(file_name,'wb'),protocol = 4)
+        # file_name = ''.join([output_path,'zq.obj'])
+        # pickle.dump(self.zq,open(file_name,'wb'),protocol = 4)
 
-        file_name = ''.join([output_path,'h.obj'])
-        pickle.dump(self.h,open(file_name,'wb'),protocol = 4)
+        # file_name = ''.join([output_path,'h.obj'])
+        # pickle.dump(self.h,open(file_name,'wb'),protocol = 4)
 
         if plt.fignum_exists(1):
             file_name = ''.join([output_path,'results.png'])
             plt.savefig(file_name)
+        file_name = f"{output_path}all.obj"
+        pickle.dump(self,open(file_name,'wb'),protocol = 4)
 
     def run_interactive(self,scale='linear'):
         ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
@@ -1476,8 +1607,8 @@ def read_params_db(sid_list,microscope='mll',det='merlin1'):
 
     th_step = get_baseline_fields(db[sid_list[1]],[th_name])[th_name] - get_baseline_fields(db[sid_list[0]],[th_name])[th_name]
 
-    if th_step == 0:
-        print(f"{th_name} doesn't change over scans.Switch to another microscope for correct theta stage")
+    if np.abs(th_step) < 1e-3:
+        print(f"{th_name} doesn't seem to change over scans.Please switch to another microscope for the correct theta stage")
 
     det_pix = det_param[det]
 
@@ -1490,7 +1621,7 @@ def read_params_db(sid_list,microscope='mll',det='merlin1'):
             "detector distance": values['diff_r']*1000,
             "pixel size": det_pix
             }
-    
+    print(json.dumps(params, indent=4))
     return params
 
 def convert_numpy(obj):
@@ -1502,3 +1633,5 @@ def convert_numpy(obj):
         return [convert_numpy(i) for i in obj]
     else:
         return obj
+    
+
