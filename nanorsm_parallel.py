@@ -13,11 +13,9 @@ from tqdm.auto import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pickle
 import os
-#from databroker import db
-from hxntools.CompositeBroker import db
+from hxntools.CompositeBroker import db, get_path
 import sys
 sys.path.insert(0, '/nsls2/data2/hxn/shared/config/bluesky_overlay/2023-1.0-py310-tiled/lib/python3.10/site-packages')
-from hxntools.CompositeBroker import db
 from hxntools.scan_info import get_scan_positions
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import concurrent.futures as concurrent
@@ -284,13 +282,16 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None):
 
 
     sid = int(sid)
-    file_names = sort_files_by_creation_time(get_path(sid, det))
+    file_names = get_path(sid, det)
+    if not isinstance(file_names,list):
+        file_names = [file_names]
+    file_names = sort_files_by_creation_time(file_names)
     data_name = '/entry/instrument/detector/data'
    
     data_blocks = []
-
+    
     for fname in file_names:
-        with h5py.File(fname, 'r') as f:
+        with h5py.File(fname, 'r',locking=False) as f:
             dset = f[data_name]
             shape = dset.shape
             dtype = np.float32  # target dtype
@@ -379,11 +380,12 @@ def load_and_sum_db(sid, det):
         data_type  = 'float32'
         data_name  = '/entry/instrument/detector/data'
         file_names = get_path(sid, det)  # get_path() must be defined in your environment
+        if not isinstance(file_names, list):
+            file_names = [file_names]
         num_subscan = len(file_names)
-        
         # If there is only one subscan, load it directly.
         if num_subscan == 1:
-            with h5py.File(file_names[0], 'r') as f:
+            with h5py.File(file_names[0], 'r',locking=False) as f:
                 # Load the dataset (here reading the whole array) 
                 data = np.asarray(f[data_name])
         else:
@@ -518,8 +520,8 @@ def process_3d_v1(subset, tmat, index):
     sz = np.shape(subset)
     x, y = np.meshgrid(np.linspace(0,sz[1],sz[1],False),np.linspace(0,sz[0],sz[0],False))
     p = np.stack([x.ravel(),y.ravel()],0)
-    p = p + u
-    trans_p = t@p
+#     p = p + u
+    trans_p = t@p + u
     trans_x = np.reshape(trans_p[0,:],x.shape)
     trans_y = np.reshape(trans_p[1,:],y.shape)
 
@@ -543,8 +545,8 @@ def process_4d_v1(subset, tmat, index):
     sz = np.shape(subset)
     x = np.linspace(0,sz[0],sz[0],False)
     
-    p = p + u
-    trans_x = t*p
+#     p = p + u
+    trans_x = t*p + u
     
     lx = np.clip(np.floor(trans_x),0,sz[1]-1).astype(int)
     hx = np.clip(np.ceil(trans_x),0,sz[1]-1).astype(int)
@@ -565,8 +567,8 @@ def process_5d_v1(subset, tmat, index):
     
     x, y = np.meshgrid(np.linspace(0,sz[1],sz[1],False),np.linspace(0,sz[0],sz[0],False))
     p = np.stack([x.ravel(),y.ravel()],0)
-    p = p + u
-    trans_p = t@p
+#     p = p + u
+    trans_p = t@p + u
     trans_x = np.reshape(trans_p[0,:],x.shape)
     trans_y = np.reshape(trans_p[1,:],y.shape)
 
@@ -1139,7 +1141,8 @@ class RSM:
         else:
             disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
         if scale == 'log':
-            disp_data = np.log(disp_data)
+            disp_data[-1] = np.log(disp_data[-1])
+            disp_data[-2] = np.log(disp_data[-2])
         interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data)
         return
 
@@ -1178,19 +1181,19 @@ def rsm_cen_x_y(data):
         print("must be 3D rsm data in lab (beam) coordinates")
     return new_data
 
-def get_path(scan_id, key_name='merlin1', db=db):
-    """Return file path with given scan id and keyname.
-    """
+# def get_path(scan_id, key_name='merlin1', db=db):
+#     """Return file path with given scan id and keyname.
+#     """
     
-    h = db[int(scan_id)]
-    e = list(db.get_events(h, fields=[key_name]))
-    #id_list = [v.data[key_name] for v in e]
-    id_list = [v['data'][key_name] for v in e]
-    rootpath = db.reg.resource_given_datum_id(id_list[0])['root']
-    flist = [db.reg.resource_given_datum_id(idv)['resource_path'] for idv in id_list]
-    flist = set(flist)
-    fpath = [os.path.join(rootpath, file_path) for file_path in flist]
-    return fpath
+#     h = db[int(scan_id)]
+#     e = list(db.get_events(h, fields=[key_name]))
+#     #id_list = [v.data[key_name] for v in e]
+#     id_list = [v['data'][key_name] for v in e]
+#     rootpath = db.reg.resource_given_datum_id(id_list[0])['root']
+#     flist = [db.reg.resource_given_datum_id(idv)['resource_path'] for idv in id_list]
+#     flist = set(flist)
+#     fpath = [os.path.join(rootpath, file_path) for file_path in flist]
+#     return fpath
 
 def interactive_map(
     names,
@@ -1509,7 +1512,7 @@ def select_roi(image):
         spancoords='pixels',
         interactive=True
     )
-
+    selector.set_active(True)
     plt.show()  # Waits for user interaction and window close
 
     return roi_holder.get('roi', None)
