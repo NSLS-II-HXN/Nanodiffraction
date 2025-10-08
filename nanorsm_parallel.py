@@ -13,9 +13,10 @@ from tqdm.auto import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
 import pickle
 import os
-from hxntools.CompositeBroker import db, get_path
 import sys
-sys.path.insert(0, '/nsls2/data2/hxn/shared/config/bluesky_overlay/2023-1.0-py310-tiled/lib/python3.10/site-packages')
+#sys.path.insert(0, '/nsls2/data2/hxn/shared/config/bluesky_overlay/2023-1.0-py310-tiled/lib/python3.10/site-packages')
+sys.path.insert(0,'/nsls2/data/hxn/legacy/home/xf03id/src/hxntools')
+from hxntools.CompositeBroker import db, get_path as get_path_new
 from hxntools.scan_info import get_scan_positions
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
 import concurrent.futures as concurrent
@@ -26,6 +27,9 @@ from tkinter import filedialog
 import warnings
 import pandas as pd
 import json
+
+global db_key
+db_key = 'new'
 
 def get_sid_list(str_list, interval):
     num_elem = np.size(str_list)
@@ -1145,8 +1149,28 @@ class RSM:
             disp_data[-2] = np.log(disp_data[-2])
         interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data)
         return
-
-
+    
+    def generate_movie(self, desc, path = None, scale='linear'):
+                  
+        ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
+        ims = np.stack(ims,axis=0)
+        im_stack = np.concatenate((self.fluo_stack,ims),axis = 0)
+        names = self.fluo_names + ['tot','strain','tilt_x','tilt_y']
+        if self.data_store == 'full':
+            disp_data = [np.swapaxes(np.sum(self.full_data,-3),-1,-2),np.swapaxes(np.sum(self.full_data,-2),-1,-2)]
+            
+        else:
+            disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
+        if scale == 'log':
+            disp_data[-1] = np.log(disp_data[-1])
+            disp_data[-2] = np.log(disp_data[-2])
+        
+        sz = np.shape(self.tot) 
+        if path is None:
+            path = generate_row_col_list(0, sz[0], 0, sz[1], fixed_row=sz[0]//2, fixed_col=sz[1]//2)
+        create_movie(desc, names,im_stack,['qx vs qz','qy vs qz'],disp_data,path)
+        return 
+    
 def cen_of_mass(c):
     c = c.ravel()
     tot = np.sum(c)
@@ -1267,7 +1291,7 @@ def interactive_map(
 
     fig.show()
 
-def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',color='white'):
+def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color='white',clim=None):
     # desc: a dictionary. Example,
     # desc ={
     #    'title':'Movie',
@@ -1284,48 +1308,54 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',color='white
     # cmap: color scheme of the plot
     # color: color of the marker
     
-    l = len(names)
-    im_sz = np.shape(im_stack)
-    l = np.fmin(l,im_sz[0])
+    n = min(len(names), im_stack.shape[0])
+    m = min(len(label),len(data_4D))
 
-    num_maps = l + 1
-    layout_row = np.round(np.sqrt(num_maps))
-    layout_col = np.ceil(num_maps/layout_row)
-    layout_row = int (layout_row)
-    layout_col = int (layout_col)
-    #plt.figure()
-    fig, axs = plt.subplots(layout_row,layout_col)
-    size_y = layout_row*4
-    size_x = layout_col*6
-    if size_x < 8:
-        size_y = size_y*8/size_x
-        size_x = 8
-    if size_y < 6:
-        size_x = size_x*6/size_y
-        size_y = 6
-    fig.set_size_inches(size_x,size_y)
-    for i in range(l):
-        axs[np.unravel_index(i,[layout_row,layout_col])].imshow(im_stack[i,:,:],cmap=cmap)
-        axs[np.unravel_index(i,[layout_row,layout_col])].set_title(names[i])
-    axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[0,0,:,:],cmap=cmap)
-    axs[np.unravel_index(l,[layout_row,layout_col])].set_title(label)
-    if layout_col*layout_row > num_maps:
-        for i in range(num_maps,layout_row*layout_col):
-            axs[np.unravel_index(i,[layout_row,layout_col])].axis('off')
+    total = n + m
+    ncols, nrows = 3, int(np.ceil(total / 3))
+
+    fig, axs = plt.subplots(
+        nrows, ncols,
+        figsize=(3 * ncols, 3 * nrows),
+        gridspec_kw={'wspace': 0.1, 'hspace': 0.2}
+    )
+    axs = axs.ravel()
+
+    # initial plotting
+    
+    for ax, name, img in zip(axs, names[:n], im_stack[:n]):
+        ax.imshow(img, cmap=cmap, aspect='auto')
+        ax.set_title(name, fontsize=9)
+        ax.axis('off')
+    for i in range(m):
+        diff_ax = axs[n+i]
+        im = diff_ax.imshow(data_4D[i][0, 0], cmap=cmap, clim=clim, aspect='auto')
+        diff_ax.set_title(label, fontsize=9)
+        diff_ax.axis('off')
+        plt.show(block=False)
+
+    for ax in axs[total:]:
+        ax.axis('off')
+
+    cbar = fig.colorbar(im, ax=diff_ax, fraction=0.046, pad=0.02)
+    cbar.ax.tick_params(labelsize=8)
+    
     fig.tight_layout()
     
     def update_fig(row,col,cmap=cmap,color=color):
-
+        
         plt.cla()
-        for i in range(l):
-            axs[np.unravel_index(i,[layout_row,layout_col])].imshow(im_stack[i,:,:],cmap=cmap)
-            axs[np.unravel_index(i,[layout_row,layout_col])].plot(col,row,marker='o',markersize=2, color=color)
-            axs[np.unravel_index(i,[layout_row,layout_col])].set_title(names[i])
-        axs[np.unravel_index(l,[layout_row,layout_col])].imshow(data_4D[row,col,:,:],cmap=cmap)
-        axs[np.unravel_index(l,[layout_row,layout_col])].set_title(label)
-        if layout_col*layout_row > num_maps:
-            for i in range(num_maps,layout_row*layout_col):
-                axs[np.unravel_index(i,[layout_row,layout_col])].axis('off')
+        for i, ax in enumerate(axs[:total]):
+            ax.clear()
+            if i < n:
+                ax.imshow(im_stack[i], cmap=cmap, aspect='auto')
+                ax.plot(col, row, 'o', color=marker_color, ms=5)
+                ax.set_title(names[i], fontsize=9)
+            else:
+                j = i - n
+                ax.imshow(data_4D[j][row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.set_title(label[j], fontsize=9)
+            ax.axis('off')
         fig.tight_layout()
         #fig.canvas.draw_idle()
         return 
@@ -1339,7 +1369,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',color='white
         writer.grab_frame()
          
         for j in tqdm(range(len(path)),desc='Progress'):       
-            update_fig(path[j,0],path[j,1],cmap=cmap,color=color)
+            update_fig(path[j][0],path[j][1],cmap=cmap,color=color)
             writer.grab_frame()
     writer.finish()
 
@@ -1513,7 +1543,7 @@ def select_roi(image):
         interactive=True
     )
     selector.set_active(True)
-    plt.show()  # Waits for user interaction and window close
+    plt.show(block=True)  # Waits for user interaction and window close
 
     return roi_holder.get('roi', None)
 
@@ -1540,7 +1570,7 @@ def slider_view(im_stack):
 
     slider.on_changed(update)
 
-    plt.show()
+    plt.show(block=True)
 
 def load_json_file():
     # Create a hidden Tkinter root window
@@ -1638,4 +1668,42 @@ def convert_numpy(obj):
     else:
         return obj
     
+def get_path_old(scan_id, key_name='merlin1', db=db):
+    """Return file path with given scan id and keyname.
+    """
+    
+    h = db[int(scan_id)]
+    e = list(db.get_events(h, fields=[key_name]))
+    #id_list = [v.data[key_name] for v in e]
+    id_list = [v['data'][key_name] for v in e]
+    rootpath = db.reg.resource_given_datum_id(id_list[0])['root']
+    flist = [db.reg.resource_given_datum_id(idv)['resource_path'] for idv in id_list]
+    flist = set(flist)
+    fpath = [os.path.join(rootpath, file_path) for file_path in flist]
+    return fpath
 
+def get_path(scan_id, key_name='merlin1', db=db):
+    global db_key
+    if db_key == 'old':
+        try:
+            return get_path_old(scan_id,key_name,db)
+        except Exception as e:
+            return get_path_new(scan_id,key_name,db)
+    else:
+        try:
+            return get_path_new(scan_id,key_name,db)
+        except Exception as e:
+            return get_path_old(scan_id,key_name,db)
+        
+def generate_row_col_list(row_start, row_end, col_start, col_end, fixed_row=None, fixed_col=None):
+    pairs = []
+
+    # Case 1: vary row with fixed column
+    if fixed_col is not None:
+        pairs.extend([[r, fixed_col] for r in range(row_start, row_end + 1)])
+
+    # Case 2: vary column with fixed row
+    if fixed_row is not None:
+        pairs.extend([[fixed_row, c] for c in range(col_start, col_end + 1)])
+
+    return pairs  
