@@ -27,9 +27,14 @@ from tkinter import filedialog
 import warnings
 import pandas as pd
 import json
+import multiprocessing as mp
 
 global db_key
 db_key = 'new'
+
+def set_db_key(value):
+    global db_key
+    db_key = value
 
 def get_sid_list(str_list, interval):
     num_elem = np.size(str_list)
@@ -282,7 +287,7 @@ def load_h5_data_db(sid,det,mon=None,roi=None,mask=None,threshold=None):
         # Resize (if necessary) and return the processed scan.
         return proc_data
 
-def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None):
+def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, bins=1):
 
 
     sid = int(sid)
@@ -309,7 +314,10 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None):
 
             # Allocate array for reading (smaller than full dataset)
             temp = np.empty(dset[roi_slices].shape, dtype=dtype)
+
             dset.read_direct(temp, source_sel=roi_slices)
+            if bins > 1:
+                temp = np.array([bin_image(frame, 2) for frame in temp])
 
             data_blocks.append(temp)
 
@@ -338,7 +346,7 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None):
 
     return proc_data
 
-def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, max_workers = 10):
+def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers = 10):
     """
     Load diffraction data from a list of scans (given by sid_list) through databroker
     with data being stacked along the first axis.
@@ -361,9 +369,9 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
     # === Process scans 1...num_scans-1 concurrently ===
     num_cores = os.cpu_count() or 1
     max_workers = min(max_workers, num_cores)
-
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = {executor.submit(load_h5_data_db_v1, sid_list[i],det, mon,roi,mask,threshold): i for i in range(num_scans)}
+    ctx = mp.get_context("spawn") #new
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = {executor.submit(load_h5_data_db_v1, sid_list[i],det, mon,roi,mask,threshold, bins): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
             try:
@@ -428,13 +436,15 @@ def sum_all_h5_data_db_parallel(sid_list, det, max_workers=10):
     # Get the number of available CPU cores and cap the workers appropriately.
     num_cores = os.cpu_count() or 1
     max_workers = min(max_workers, num_cores)
+    ctx = mp.get_context("spawn") #new
+    
     print(f"Using {max_workers} workers (desired: {max_workers}, available cores: {num_cores}).")
     
     # List to hold per-scan summed data (preserving original order).
     scan_sum_list = [None] * num_scans
 
     # Process scans concurrently.
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
         # Map each scan ID to its future.
         futures = {executor.submit(load_and_sum_db, sid_list[i], det): i for i in range(num_scans)}
         # Use as_completed (with tqdm for progress) to collect the results.
@@ -1707,3 +1717,11 @@ def generate_row_col_list(row_start, row_end, col_start, col_end, fixed_row=None
         pairs.extend([[fixed_row, c] for c in range(col_start, col_end + 1)])
 
     return pairs  
+def bin_image(img, bins = 2):
+    h, w = img.shape
+    h_new = h // bins
+    w_new = w // bins
+    img = img[:h_new*bins, :w_new*bins]  # crop to fit
+    img = img.reshape(h_new, bins, w_new, bins)
+    return img.sum(axis=(1, 3))
+    
