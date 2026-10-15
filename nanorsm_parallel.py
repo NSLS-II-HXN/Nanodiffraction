@@ -2,12 +2,14 @@ import numpy as np
 from pystackreg import StackReg
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector
+from matplotlib.colors import LogNorm
 import matplotlib.animation as manimation
 from matplotlib.widgets import Slider
 import tifffile
 import h5py
 from scipy.optimize import curve_fit
 from scipy.special import wofz  # For Voigt
+from scipy import ndimage
 #import csv
 from tqdm.auto import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -35,6 +37,7 @@ import warnings
 import pandas as pd
 import json
 import multiprocessing as mp
+import psutil
 
 global db_key
 db_key = 'new'
@@ -93,6 +96,19 @@ def get_sid_list(str_list, interval):
 #     return im_stack
 
 def load_ims(file_list):
+    """
+    Load a stack of TIFF images and center-pad them to the same dimensions.
+
+    Parameters
+    ----------
+    file_list : list of str
+        List of file paths to the TIFF images.
+
+    Returns
+    -------
+    im_stack : np.ndarray
+        3D array containing the stacked images with shape (num_ims, max_row, max_col).
+    """
     # First pass: determine max image size
     max_row, max_col = 0, 0
     for fname in file_list:
@@ -118,6 +134,19 @@ def load_ims(file_list):
 
 
 def load_txts(file_list):
+    """
+    Load a stack of text-based images (e.g., .txt files) and center-pad them to the same dimensions.
+
+    Parameters
+    ----------
+    file_list : list of str
+        List of file paths to the text-based images.
+
+    Returns
+    -------
+    im_stack : np.ndarray
+        3D array containing the stacked images with shape (num_ims, max_row, max_col).
+    """
     # stacking is along the first axis
     num_ims = np.size(file_list)
     for i in tqdm(range(num_ims),desc="Progress"):
@@ -149,13 +178,76 @@ def load_txts(file_list):
 
 def create_file_list(data_path, prefix, postfix, sid_list):
     num = np.size(sid_list)
-    file_list = []
-    for sid in sid_list:
-        # tmp = ''.join([data_path, prefix,'{}'.format(sid),postfix])
-        tmp = f"{data_path}{prefix}{sid}{postfix}"
-        file_list.append(tmp)
+    file_list = [f"{data_path}{prefix}{sid}{postfix}" for sid in sid_list]
     return file_list
 
+def get_fluorescence_image_dimensions(data_path, sid_list, elem_list):
+    """
+    Read the first available fluorescence image to determine target dimensions.
+    
+    Parameters
+    ----------
+    data_path : str
+        Path to the XRF data directory (e.g., '//data//users//2026Q2//Sun_2026Q2//xrf//')
+    sid_list : array-like
+        List of scan IDs
+    elem_list : list
+        List of element names (e.g., ['Fe_K', 'Cr_K'])
+    
+    Returns
+    -------
+    tuple
+        (target_height, target_width) dimensions of the fluorescence images
+    """
+    # Try each element and sid combination to find first available file
+    for elem in elem_list:
+        for sid in sid_list:
+            test_file = f"{data_path}output_tiff_scan2D_{sid}//detsum_{elem}_norm.tiff"
+            if os.path.exists(test_file):
+                try:
+                    im = tifffile.imread(test_file)
+                    height, width = im.shape
+                    print(f"Detected fluorescence image dimensions from {test_file}: {height}x{width}")
+                    return (height, width)
+                except Exception as e:
+                    print(f"Error reading {test_file}: {e}")
+                    continue
+    raise FileNotFoundError(f"Could not find any valid fluorescence image in {data_path}")
+
+
+def downsample_image_stack(im_stack, target_shape):
+    """
+    Downsample (or upsample) image stack to target dimensions using cubic interpolation.
+    
+    Parameters
+    ----------
+    im_stack : ndarray
+        Image stack with shape (num_frames, height, width)
+    target_shape : tuple
+        Target dimensions (target_height, target_width)
+    
+    Returns
+    -------
+    ndarray
+        Downsampled image stack with shape (num_frames, target_height, target_width)
+    """
+    num_frames, curr_height, curr_width = im_stack.shape
+    target_height, target_width = target_shape
+    
+    # Calculate zoom factors for each dimension
+    zoom_factors = (
+        1.0,  # no scaling along frame axis
+        target_height / curr_height,
+        target_width / curr_width
+    )
+    
+    # Apply zoom using cubic interpolation (order=3)
+    im_stack_downsampled = ndimage.zoom(im_stack, zoom_factors, order=3)
+    
+    print(f"Downsampled from {curr_height}x{curr_width} to {target_height}x{target_width}")
+    print(f"Image stack shape: {im_stack.shape} → {im_stack_downsampled.shape}")
+    
+    return im_stack_downsampled.astype(im_stack.dtype)
 
 def align_im_stack(im_stack):
     # default stacking axis is zero
@@ -192,7 +284,8 @@ def load_h5_data(file_list, roi, mask):
     data_type = 'float32'
     
     num_scans = np.size(file_list)
-    det = '/entry/instrument/detector/data'
+    #det = '/entry/instrument/detector/data'
+    det = '/diff_data/merlin1/det_images'
     for i in tqdm(range(num_scans),desc="Progress"):
         file_name = file_list[i]
         f = h5py.File(file_name,'r')       
@@ -217,29 +310,39 @@ def load_h5_data(file_list, roi, mask):
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
     return diff_data 
 
-def load_h5_data_single(file_name,data_name,roi,mask,threshold):
+def load_h5_data_single(file_name,data_name,roi,mask,threshold,bins=1,flip=True):
     # Each thread will open a file, process it and return the index, data, and raw-size.
     # Using a context manager ensures the file is closed.
-    with h5py.File(file_name[0], 'r') as f:
-        dset = np.asarray(f[data_name])
-        # Read the full dataset (or use slices if desired)
-        # Multiply by the mask if one is provided.
-        if mask is None:
-            data = dset[...]
-        else:
-            data = dset[...] * mask
-        # Apply ROI if provided; else flip the full dataset.
+    with h5py.File(file_name, 'r', locking=False) as f:
+        dset = f[data_name]
         if roi is None:
-            data = np.flip(data[:,:,:], axis=1)
+            rs, cs = slice(None), slice(None)
         else:
-            data = np.flip(data[:, roi[0]:roi[0]+roi[2], roi[1]:roi[1]+roi[3]], axis=1)
-        raw_size = np.shape(dset)
+            rs, cs = slice(roi[0], roi[0] + roi[2]), slice(roi[1], roi[1] + roi[3])
+        n, nr, nc = dset.shape
+        shape = (n, len(range(*rs.indices(nr))), len(range(*cs.indices(nc))))
+        # float32 avoids integer overflow when summing pixels of raw integer frames
+        data = np.empty(shape, dtype=np.float32)
+        dset.read_direct(data, source_sel=(slice(None), rs, cs))
+    if mask is not None:
+        data *= mask[rs, cs]
+    if bins > 1:
+        data = np.array([bin_image(frame, bins) for frame in data])
+    if flip:
+        data = np.flip(data, axis=1)
     if threshold is not None:
         data[data < threshold[0]] = 0
         data[data > threshold[1]] = 0
     return data
 
-def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None):
+def _estimate_h5_task_bytes(file_name, data_name, roi=None):
+    with h5py.File(file_name, 'r', locking=False) as f:
+        n, rows, cols = f[data_name].shape
+    if roi is not None:
+        rows, cols = roi[2], roi[3]
+    return n * rows * cols * 4  # float32 ROI buffer read by one worker
+
+def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None, h5_type='diff_view', bins=1, max_workers=10, memory_safety=0.7):
     """
     Load a list of HDF5 (h5) files, apply optional ROI and mask,
     flip the data along axis=1, and stack the results along the first axis.
@@ -248,24 +351,39 @@ def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None):
     roi: [row_start, col_start, row_size, col_size] or None
     mask: an array of the same shape as each image data, or None.
     threshold: set pixel outside the bound [low, high] to zero, or None 
+    h5_type: 'diff_view' for files exported from diff_view, otherwise raw detector files
+    bins: binning factor applied to each frame after the ROI crop
+    max_workers: upper limit on worker processes; further reduced to fit available memory
+    memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is
     """
     data_type = 'float32'
     num_scans = len(file_list)
-    data_name = '/entry/instrument/detector/data'
+    if h5_type == 'diff_view':
+        data_name = '/diff_data/merlin1/det_images' # for h5 files exported from diff_view
+    else:
+        data_name = '/entry/instrument/detector/data' # for h5 raw data
 
 
+    if file_list is None or len(file_list) == 0:
+        raise ValueError("file_list is empty or None.")
 
-    # Create a list to hold results (preserving file order)
-    results = [None] * num_scans
+    max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = _cap_workers_by_memory(max_workers, _estimate_h5_task_bytes(file_list[0], data_name, roi), safety=memory_safety)
+    ctx = mp.get_context("spawn")
 
-    # Launch threads to process each file concurrently.
-    with ProcessPoolExecutor() as executor:
-        # Create a dictionary mapping futures to index
-        futures = {executor.submit(load_h5_data_single, file_list[i],data_name,roi,mask,threshold): i for i in range(num_scans)}
+    results = None  # allocated on the first result to avoid a second full-size copy
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = {executor.submit(load_h5_data_single, file_list[i],data_name,roi,mask,threshold,bins): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
-            results[idx] = future.result()
-    results = np.stack(results)
+            try:
+                result = future.result()
+                if results is None:
+                    results = np.zeros((num_scans,) + result.shape, dtype=result.dtype)
+                results[idx] = result
+                del result
+            except Exception as e:
+                print(f"Error processing file index {idx}: {e}")
 
     # If there is only one scan, assume a rocking curve scan and swap axes.
     if num_scans == 1:
@@ -318,7 +436,23 @@ def load_h5_data_db(sid,det,mon=None,roi=None,mask=None,threshold=None):
         # Resize (if necessary) and return the processed scan.
         return proc_data
 
-def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, bins=1):
+def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, bins=1, flip=True):
+    """
+    Load HDF5 data from the database with optional ROI, mask, thresholding, and binning.
+
+    Parameters:
+        sid (int): Scan ID.
+        det (str): Detector name.
+        mon (str, optional): Monitor channel for normalization.
+        roi (tuple, optional): Region of interest (r0, c0, rsz, csz) for each frame.
+        mask (ndarray, optional): Mask to apply to the data for the scan region.
+        threshold (tuple, optional): Threshold values (min, max).
+        bins (int, optional): Binning factor (default is 1).
+        flip (bool, optional): Flip vertically (axis=1) before returning (default is True).
+
+    Returns:
+        ndarray: Processed data array.
+    """
 
 
     sid = int(sid)
@@ -348,7 +482,7 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, 
 
             dset.read_direct(temp, source_sel=roi_slices)
             if bins > 1:
-                temp = np.array([bin_image(frame, 2) for frame in temp])
+                temp = np.array([bin_image(frame, bins) for frame in temp])
 
             data_blocks.append(temp)
 
@@ -373,11 +507,36 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, 
         data *= mask
 
     # Flip vertically (along axis=1)
-    proc_data = np.flip(data, axis=1)
+    proc_data = np.flip(data, axis=1) if flip else data
 
     return proc_data
 
-def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers = 10):
+def _cap_workers_by_memory(max_workers, per_task_bytes, safety=0.7, overhead=2.0, reserve_bytes=0):
+    # overhead covers temporaries and the pickled result copy held while a task finishes
+    # reserve_bytes is memory already promised elsewhere, e.g. arrays allocated but not yet touched
+    if safety > 1 or safety < 0:  # out-of-range disables the guard
+        return max_workers
+    avail = psutil.virtual_memory().available
+    n_fit = int((avail * safety - reserve_bytes) // (per_task_bytes * overhead))
+    capped = max(1, min(max_workers, n_fit))
+    if capped < max_workers:
+        print(f"Memory guard: max_workers reduced from {max_workers} to {capped} "
+              f"({avail/1e9:.1f} GB available, ~{per_task_bytes/1e9:.2f} GB per task).")
+    return capped
+
+def _estimate_scan_bytes(sid, det, roi=None):
+    file_names = get_path(int(sid), det)
+    if not isinstance(file_names, list):
+        file_names = [file_names]
+    frames = 0
+    for fname in file_names:
+        with h5py.File(fname, 'r', locking=False) as f:
+            shape = f['/entry/instrument/detector/data'].shape
+        frames += shape[0]
+    rows, cols = (shape[1], shape[2]) if roi is None else (roi[2], roi[3])
+    return frames * rows * cols * 4
+
+def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers = 10, memory_safety=0.7):
     """
     Load diffraction data from a list of scans (given by sid_list) through databroker
     with data being stacked along the first axis.
@@ -389,6 +548,9 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
       roi: a list of [row_start, col_start, row_size, col_size]. If None, the full image is used.
       mask: an array to be multiplied with the detector data. Must be of appropriate shape.
       threshold: two-element list [lower, upper] to clip pixel values.
+      bins (int): Binning factor for each frame.
+      max_workers: upper limit on worker processes; further reduced to fit available memory.
+      memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is.
       
     Returns:
       diff_data: stacked diffraction data with shape (num_scans, frames, row, col)
@@ -396,27 +558,115 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
     """
     num_scans = np.size(sid_list)
     
-    diff_data = [None]*num_scans
+    diff_data = None  # allocated on the first result to avoid a second full-size copy
     # === Process scans 1...num_scans-1 concurrently ===
     num_cores = os.cpu_count() or 1
     max_workers = min(max_workers, num_cores)
+    max_workers = _cap_workers_by_memory(max_workers, _estimate_scan_bytes(sid_list[0], det, roi), safety=memory_safety)
     ctx = mp.get_context("spawn") #ensure to create a new db session for each subprocess to be fork-safe
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
         futures = {executor.submit(load_h5_data_db_v1, sid_list[i],det, mon,roi,mask,threshold, bins): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
             try:
-                diff_data[idx] = future.result()
+                result = future.result()
+                if diff_data is None:
+                    diff_data = np.zeros((num_scans,) + result.shape, dtype=result.dtype)
+                diff_data[idx] = result
+                del result
             except Exception as e:
-                print(f"Error processing scan index {i}: {e}")
+                print(f"Error processing scan index {idx}: {e}")
     
     # If only one scan was loaded, assume a rocking curve scan: swap axes.
-    diff_data = np.asarray(diff_data)
     if num_scans == 1:
         diff_data = np.swapaxes(diff_data, 0, 1)
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
     
     return diff_data
+
+def sum_h5_data_db_single(sid, det, sum_over, mon=None, roi=None, mask=None, threshold=None, bins=1):
+    if sum_over == 'frames':
+        # unflipped so the summed image stays in the raw detector orientation used by roi
+        data = load_h5_data_db_v1(sid, det, mon, roi, mask, threshold, bins, flip=False)
+        return np.sum(data, axis=0)
+    data = load_h5_data_db_v1(sid, det, mon, roi, mask, threshold, bins)
+    return np.sum(data, axis=(1, 2))
+
+def sum_h5_data_db_parallel(sid_list, det, sum_over='frames', mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers=10, memory_safety=0.7):
+    """
+    Sum the detector data of each scan (located through databroker) without keeping the frames.
+    Multiple subscans of one scan ID are concatenated before summing.
+
+    sum_over:
+      'frames'     : sum over the scan points and over all scans; returns one detector image (row, col).
+      'det_pixels' : sum over the detector plane for each frame; returns (num_scans, num_positions).
+    Other parameters are the same as in load_h5_data_db_parallel.
+    """
+    if sum_over not in ('frames', 'det_pixels'):
+        raise ValueError("sum_over must be 'frames' or 'det_pixels'")
+    num_scans = np.size(sid_list)
+    max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = _cap_workers_by_memory(max_workers, _estimate_scan_bytes(sid_list[0], det, roi), safety=memory_safety)
+    ctx = mp.get_context("spawn") # fresh db session per subprocess
+    results = [None] * num_scans
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = {executor.submit(sum_h5_data_db_single, sid_list[i], det, sum_over, mon, roi, mask, threshold, bins): i for i in range(num_scans)}
+        for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                print(f"Error processing scan {sid_list[idx]}: {e}")
+    results = np.stack(results)
+    return np.sum(results, axis=0) if sum_over == 'frames' else results
+
+def _resolve_source(file_list, source):
+    if source not in ('auto', 'h5', 'db'):
+        raise ValueError("source must be 'auto', 'h5', or 'db'")
+    if source == 'db':
+        return 'db'
+    missing = [f for f in file_list if not os.path.isfile(f)]
+    if source == 'h5':
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} of {len(file_list)} diffraction files are missing: {missing}")
+        return 'h5'
+    if not missing:
+        return 'h5'
+    if len(missing) == len(file_list):
+        return 'db'
+    raise ValueError(f"{len(missing)} of {len(file_list)} diffraction files are missing: {missing}")
+
+def load_diff_data(file_list, sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers=10, source='auto', memory_safety=0.7):
+    """
+    Load diffraction data from the h5 files in file_list or through databroker.
+
+    Parameters:
+      file_list: list of h5 file paths corresponding to the scans.
+      sid_list: list or array of scan IDs.
+      det: key to locate the detector information (passed to get_path).
+      mon: if provided, use monitor data to normalize each scan.
+      roi: a list of [row_start, col_start, row_size, col_size]. If None, the full image is used.
+      mask: an array to be multiplied with the detector data, applied to the sample image. Must be of appropriate shape.
+      threshold: two-element list [lower, upper] to clip pixel values.
+      bins (int): Binning factor for each frame.
+      max_workers: upper limit on worker processes; further reduced to fit available memory.
+      source: 'auto' (h5 files if all exist, databroker if none do, ValueError if only some do),
+              'h5' (require the files), or 'db' (always databroker).
+      memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is.
+      
+    Returns:
+      diff_data: stacked diffraction data with shape (num_scans, frames, row, col)
+                 (or, if only one scan exists, a rocking curve with angle moved to the first axis).
+    """
+    if _resolve_source(file_list, source) == 'h5':
+        if mon is not None:
+            warnings.warn("mon is ignored when loading from h5 files.")
+        print("Loading diffraction data from h5 files.")
+        return load_h5_data_parallel(file_list, roi=roi, mask=mask, threshold=threshold, bins=bins,
+                                    max_workers=max_workers, memory_safety=memory_safety)
+    print("Loading diffraction data from databroker.")
+    return load_h5_data_db_parallel(sid_list, det, mon=mon, roi=roi, mask=mask, threshold=threshold, bins=bins,
+                                    max_workers=max_workers, memory_safety=memory_safety)
 
 def load_and_sum_db(sid, det):
         sid = int(sid)
@@ -493,28 +743,70 @@ def sum_all_h5_data_db_parallel(sid_list, det, max_workers=10):
     return scan_sum_list
 
 
-def load_and_sum(file_name):
-    dataset_path='/entry/instrument/detector/data'
-    with h5py.File(file_name[0], 'r') as f:
-        data = np.asarray(f[dataset_path])
-    return np.sum(data, axis=0)  # sum along time or scan axis
+def sum_h5_data_single(file_name, data_name, sum_over, roi=None, mask=None, threshold=None, bins=1):
+    if sum_over == 'frames':
+        # unflipped so the summed image stays in the raw detector orientation used by roi
+        data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins, flip=False)
+        return np.sum(data, axis=0)
+    data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins)
+    return np.sum(data, axis=(1, 2))
 
+def sum_h5_data_parallel(file_list, sum_over='frames', h5_type='diff_view', roi=None, mask=None, threshold=None, bins=1, max_workers=10, memory_safety=0.7):
+    """
+    Sum the detector data of each h5 file in file_list without keeping the frames.
+    File-based counterpart of sum_h5_data_db_parallel.
 
-def sum_all_h5_data_parallel(file_list):
+    sum_over:
+      'frames'     : sum over the scan points and over all files; returns one detector image (row, col).
+      'det_pixels' : sum over the detector plane for each frame; returns (num_files, num_positions).
+    h5_type: 'diff_view' for files exported from diff_view, otherwise raw detector files.
+    Other parameters are the same as in load_h5_data_parallel.
+    """
+    if sum_over not in ('frames', 'det_pixels'):
+        raise ValueError("sum_over must be 'frames' or 'det_pixels'")
+    if file_list is None or len(file_list) == 0:
+        raise ValueError("file_list is empty or None.")
     num_scans = len(file_list)
-    results = [None]*num_scans
-    
-    with ProcessPoolExecutor(max_workers = 10) as executor:
-        # Submit all tasks to the pool
-        futures = {executor.submit(load_and_sum, file_list[i]): i for i in range(num_scans)}
-        for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):           
-            idx = futures[future]
-            results[idx] = future.result()  
+    if h5_type == 'diff_view':
+        data_name = '/diff_data/merlin1/det_images'
+    else:
+        data_name = '/entry/instrument/detector/data'
 
-    # Sum all partial results
+    with h5py.File(file_list[0], 'r') as f:
+        per_task_bytes = f[data_name].size * 4  # float32 working copy
+    max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = _cap_workers_by_memory(max_workers, per_task_bytes, safety=memory_safety)
+
+    results = [None] * num_scans
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(sum_h5_data_single, file_list[i], data_name, sum_over,
+                                   roi, mask, threshold, bins): i for i in range(num_scans)}
+        for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):
+            idx = futures[future]
+            results[idx] = future.result()
+
     results = np.stack(results)
-    sum_all_data = np.sum(results, axis=0)
-    return sum_all_data
+    return np.sum(results, axis=0) if sum_over == 'frames' else results
+
+def sum_diff_data(file_list, sid_list, det, max_workers=10, sum_over='frames', mon=None, roi=None, mask=None, threshold=None, bins=1, source='auto', memory_safety=0.7):
+    """
+    Sum diffraction data from the h5 files in file_list or through databroker.
+    source: 'auto' (h5 files if all exist, databroker if none do, ValueError if only some do),
+            'h5' (require the files), or 'db' (always databroker).
+    memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is.
+    See sum_h5_data_db_parallel for sum_over.
+    """
+    if _resolve_source(file_list, source) == 'h5':
+        if mon is not None:
+            warnings.warn("mon is ignored when summing from h5 files.")
+        print("Summing diffraction data from h5 files.")
+        return sum_h5_data_parallel(file_list, sum_over=sum_over, roi=roi, mask=mask,
+                                    threshold=threshold, bins=bins, max_workers=max_workers,
+                                    memory_safety=memory_safety)
+    print("Summing diffraction data from databroker.")
+    return sum_h5_data_db_parallel(sid_list, det, sum_over=sum_over, mon=mon, roi=roi, mask=mask,
+                                   threshold=threshold, bins=bins, max_workers=max_workers,
+                                   memory_safety=memory_safety)
 
 
 def process_3d(subset, shift_matrix, index):
@@ -589,18 +881,13 @@ def process_4d_v1(subset, tmat, index):
     # inv_t = np.linalg.inv(t)
     sz = np.shape(subset)
     x = np.linspace(0,sz[0],sz[0],False)
-    
-#     p = p + u
-    trans_x = t*p + u
-    
-    lx = np.clip(np.floor(trans_x),0,sz[1]-1).astype(int)
-    hx = np.clip(np.ceil(trans_x),0,sz[1]-1).astype(int)
-    lx_subset = subset[lx]
-    hx_subset = subset[hx]
-     
-    rx = trans_x - lx
-     
-    return (1 - rx) * lx_subset + rx * hx_subset 
+    trans_x = t*x + u
+
+    lx = np.clip(np.floor(trans_x),0,sz[0]-1).astype(int)
+    hx = np.clip(np.ceil(trans_x),0,sz[0]-1).astype(int)
+    rx = (trans_x - lx).reshape((-1,) + (1,)*(subset.ndim-1))
+
+    return (1 - rx) * subset[lx] + rx * subset[hx]
 
 
 def process_5d_v1(subset, tmat, index):
@@ -635,14 +922,22 @@ def process_5d_v1(subset, tmat, index):
     return v00[:,:,np.newaxis,np.newaxis] * lxly_subset + v10[:,:,np.newaxis,np.newaxis] * hxly_subset \
         + v01[:,:,np.newaxis,np.newaxis] * lxhy_subset + v11[:,:,np.newaxis,np.newaxis] * hxhy_subset
 
-def interp_sub_pix(data, shift_matrix, max_workers = 10):
+def _get_executor(executor_type, max_workers):
+    if executor_type == 'thread':
+        return ThreadPoolExecutor(max_workers=max_workers)
+    if executor_type == 'process':
+        return ProcessPoolExecutor(max_workers=max_workers)
+    raise ValueError("executor_type must be 'thread' or 'process'.")
+
+def interp_sub_pix(data, shift_matrix, max_workers = 10, executor_type = 'thread'):
     '''
     Parallelized function to apply sub-pixel shifts to 3D, 4D, or 5D data.
 
     Parameters:
         data (ndarray): Input data of shape (N, ...) where N is the first axis.
         shift_matrix (ndarray): Shift values corresponding to each slice.
-        max_workers (int): Number of parallel workers (default: 8).
+        max_workers (int): Number of parallel workers (default: 10).
+        executor_type (str): 'thread' (default) or 'process'.
 
     Returns:
         ndarray: Shifted data of the same shape as input.
@@ -662,7 +957,7 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     
     available_cores = os.cpu_count() or 1
     max_workers = min(max_workers, available_cores)
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with _get_executor(executor_type, max_workers) as executor:
         # Submit a task for each slice
         futures = {executor.submit(process_func, subset, shift_matrix, index): index for index, subset in enumerate(data)}
 
@@ -672,14 +967,15 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     
     return data
 
-def interp_sub_pix_v1(data, tmat, max_workers = 10):
+def interp_sub_pix_v1(data, tmat, max_workers = 10, executor_type = 'thread'):
     '''
     Parallelized function to apply sub-pixel shifts to 3D, 4D, or 5D data.
 
     Parameters:
         data (ndarray): Input data of shape (N, ...) where N is the first axis.
-        shift_matrix (ndarray): Shift values corresponding to each slice.
-        max_workers (int): Number of parallel workers (default: 8).
+        tmat (ndarray): Transform matrices corresponding to each slice.
+        max_workers (int): Number of parallel workers (default: 10).
+        executor_type (str): 'thread' (default) or 'process'.
 
     Returns:
         ndarray: Shifted data of the same shape as input.
@@ -699,7 +995,7 @@ def interp_sub_pix_v1(data, tmat, max_workers = 10):
     
     available_cores = os.cpu_count() or 1
     max_workers = min(max_workers, available_cores)
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with _get_executor(executor_type, max_workers) as executor:
         # Submit a task for each slice
         futures = {executor.submit(process_func, subset, tmat, index): index for index, subset in enumerate(data)}
 
@@ -708,6 +1004,26 @@ def interp_sub_pix_v1(data, tmat, max_workers = 10):
             data[idx] = future.result()
     
     return data
+
+def save_aligned_stack(im_stack, trans_matrix, output_path, name):
+    """Apply the alignment in place, save the stack as <output_path><name>.tiff, and return (stack, summed image)."""
+    im_stack = interp_sub_pix_v1(im_stack, trans_matrix)
+    imp = np.sum(im_stack, axis=0)
+    tifffile.imwrite(f"{output_path}{name}.tiff", im_stack.astype(np.float32), imagej=True)
+    print(f"save {name} to {output_path}{name}.tiff")
+    return im_stack, imp
+
+def save_ims(file_list, trans_matrix, output_path, name, flip_axis=None, target_shape=None):
+    """
+    Load the images in file_list, optionally flip along flip_axis and downsample to target_shape,
+    then align and save them with save_aligned_stack. Returns (aligned stack, summed image).
+    """
+    im_stack = load_ims(file_list)
+    if flip_axis is not None:
+        im_stack = np.flip(im_stack, axis=flip_axis)
+    if target_shape is not None:
+        im_stack = downsample_image_stack(im_stack, target_shape)
+    return save_aligned_stack(im_stack, trans_matrix, output_path, name)
 
 def trans_coor3D(X, Y, Z, M):
     '''Transform coordinates (X,Y,Z) by 3x3 matrix M (e.g., rotation/transform).'''
@@ -790,6 +1106,14 @@ def interp3_oblique(X, Y, Z, V, M, Vx, Vy, Vz):
     return Vq_flat.reshape(Vx.shape)
 
 
+def interp3_oblique_reduced(X, Y, Z, V, M, Vx, Vy, Vz):
+    vq = interp3_oblique(X, Y, Z, V, M, Vx, Vy, Vz)
+    qxz = np.sum(vq, axis=0)
+    qyz = np.sum(vq, axis=1)
+    del vq
+    return qxz, qyz
+
+
 class RSM:
     def __init__(self, det_data, energy, delta, gamma, num_angle, th_step, pix, det_dist, offset, fluo_stack=None, fluo_names=None):
         # input det_data [angle,position, det_row,det_col]
@@ -806,13 +1130,22 @@ class RSM:
         self.k = 1e4 / (12.398/energy)
         self.fluo_stack = fluo_stack
         self.fluo_names = fluo_names
-    def calcRSM(self, coor, data_store='reduced', desired_workers=10):
+    def calcRSM(self, coor, data_store='reduced', desired_workers=60, parallel_mode='thread', memory_safety=0.7, save_det_data=None):
     
         '''
         Calculate reciprocal space mapping (RSM) from the detector data.
         The bulk of the work is done by interpolating the transformed detector data
         onto a grid. Parallel processing is used to speed up the per-scan interpolation.
+        parallel_mode: 'thread' (ThreadPoolExecutor) or 'process' (ProcessPoolExecutor).
+        memory_safety: fraction of available memory the outputs and workers may use; outside [0, 1] disables the guard.
+        save_det_data: .npy path; if given, the input det_data is saved there before it is reshaped and later deleted.
         '''
+        if parallel_mode == 'thread':
+            Executor = ThreadPoolExecutor
+        elif parallel_mode == 'process':
+            Executor = ProcessPoolExecutor
+        else:
+            raise ValueError("parallel_mode must be 'thread' or 'process'")
         
         # --- Standard computations to set up matrices and grids ---
         sz = np.shape(self.det_data)
@@ -877,11 +1210,27 @@ class RSM:
 
         # --- Reshape and prepare the detector data ---
         # self.det_data = np.squeeze(np.swapaxes(np.expand_dims(self.det_data, axis=-1), 0, -1), 0)
+        if save_det_data is not None:
+            np.save(save_det_data, self.det_data)  # raw [angle, ..., det_row, det_col] layout, as attach_det_data expects
         self.det_data = np.moveaxis(self.det_data, 0, -1)
 
         sz = np.shape(self.det_data)
         self.det_data = np.reshape(self.det_data, [-1, sz[-3], sz[-2], sz[-1]])
         new_sz = np.shape(self.det_data)
+
+        # --- Memory guard: preallocated outputs plus per-task interpolation temporaries ---
+        n_vox = int(np.prod(trans_sz))
+        if data_store == 'full':
+            output_bytes = new_sz[0] * n_vox * 4
+        else:
+            output_bytes = new_sz[0] * (trans_sz[0] + trans_sz[1]) * trans_sz[2] * 4
+        per_task_bytes = 25 * n_vox * 4  # about 25 float32/int32 arrays of grid size live in interp3_oblique
+        if 0 <= memory_safety <= 1:
+            budget = psutil.virtual_memory().available * memory_safety
+            if output_bytes > budget:
+                raise MemoryError(f"calcRSM output needs ~{output_bytes/1e9:.1f} GB but only {budget/1e9:.1f} GB "
+                                  f"is allowed ({memory_safety:.0%} of available). Use data_store='reduced', "
+                                  f"a larger bins, or a smaller roi.")
 
         if data_store == 'full':
             self.full_data = np.zeros((new_sz[0], trans_sz[0], trans_sz[1], trans_sz[2]),
@@ -894,20 +1243,37 @@ class RSM:
         # Determine number of workers; if desired_workers is unspecified, use available cores.
         available_cores = os.cpu_count() or 1
         max_workers = min(desired_workers, available_cores)
-        
+        max_workers = _cap_workers_by_memory(max_workers, per_task_bytes, safety=memory_safety,
+                                             overhead=1.0 if parallel_mode == 'thread' else 2.0,
+                                             reserve_bytes=output_bytes)
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(interp3_oblique, X, Y, Z, self.det_data[i, :, :, :],
-                                 M_inv, xq, yq, zq): i for i in range(new_sz[0])}
-            for future in tqdm(as_completed(futures), total=new_sz[0],
-                               desc="Processing scans in parallel"):
-                idx = futures[future]
-                vq = future.result()
-                if data_store == 'full':
-                    self.full_data[idx, :, :, :] = vq
-                else:
-                    self.qxz_data[idx, :, :] = np.sum(vq, axis=0)
-                    self.qyz_data[idx, :, :] = np.sum(vq, axis=1)
+        # Threads share memory (numpy releases the GIL); processes pickle inputs/results per task.
+        chunk_size = max_workers
+        with Executor(max_workers=max_workers) as executor:
+            with tqdm(total=new_sz[0], desc="Processing scans in parallel") as pbar:
+                for batch_start in range(0, new_sz[0], chunk_size):
+                    batch_end = min(batch_start + chunk_size, new_sz[0])
+                    if data_store == 'full':
+                        futures = {executor.submit(interp3_oblique, X, Y, Z, self.det_data[i, :, :, :],
+                                     M_inv, xq, yq, zq): i for i in range(batch_start, batch_end)}
+                    else:
+                        futures = {executor.submit(interp3_oblique_reduced, X, Y, Z, self.det_data[i, :, :, :],
+                                     M_inv, xq, yq, zq): i for i in range(batch_start, batch_end)}
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        if data_store == 'full':
+                            vq = future.result()
+                            self.full_data[idx, :, :, :] = vq
+                            del vq
+                        else:
+                            qxz, qyz = future.result()
+                            self.qxz_data[idx, :, :] = qxz
+                            self.qyz_data[idx, :, :] = qyz
+                            del qxz, qyz
+                        del futures[future]
+                        pbar.update(1)
+                    del futures
+                    gc.collect()
 
         # --- Save grid and metadata ---
         self.xq = xq
@@ -1127,22 +1493,24 @@ class RSM:
 
         #plt.savefig('./result.png')
               
-    def save(self,output_path):
+    def save(self,output_path,file_name=None):
+        # file_name is a prefix (e.g. 'scan123' -> 'scan123_strain_map.tif'); None keeps the default names
+        prefix = '' if file_name is None else f'{file_name}_'
 
         if not os.path.exists(output_path):
             os.mkdir(output_path)
             print("Directory '%s' created" %output_path)
         
-        file_name = ''.join([output_path,'tot_intensity_map.tif'])
-        tifffile.imsave(file_name,np.asarray(self.tot,dtype=np.float32),imagej=True)
+        file_name = ''.join([output_path,prefix,'tot_intensity_map.tif'])
+        tifffile.imwrite(file_name,np.asarray(self.tot,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'strain_map.tif'])
+        file_name = ''.join([output_path,prefix,'strain_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.strain,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'tilt_x_map.tif'])
+        file_name = ''.join([output_path,prefix,'tilt_x_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.tilt_x,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'tilt_y_map.tif'])
+        file_name = ''.join([output_path,prefix,'tilt_y_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.tilt_y,dtype=np.float32),imagej=True)
 
         # file_name = ''.join([output_path,'pos_rsm_xz.obj'])
@@ -1175,6 +1543,41 @@ class RSM:
         file_name = f"{output_path}all.obj"
         pickle.dump(self,open(file_name,'wb'),protocol = 4)
 
+    @classmethod
+    def load(cls, file_name=None, det_data=None, mmap=False):
+        # file_name may be an all.obj path or a directory containing it; None opens a file dialog
+        # det_data: array, .npy path, or True to also load diff_data.npy next to all.obj (see attach_det_data)
+        if file_name is None:
+            file_name = select_file()
+        elif os.path.isdir(file_name):
+            file_name = os.path.join(file_name, 'all.obj')
+        with open(file_name, 'rb') as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, cls):
+            raise TypeError(f"{file_name} does not contain an RSM object.")
+        obj.source_dir = os.path.dirname(os.path.abspath(file_name))
+        if det_data is not None:
+            obj.attach_det_data(det_data, mmap=mmap)
+        return obj
+
+    def attach_det_data(self, det_data=True, mmap=False):
+        """
+        Restore the raw detector data [angle, ..., det_row, det_col] that calcRSM deletes.
+        det_data: array, path to a .npy file, or True for diff_data.npy in the folder all.obj was loaded from.
+        mmap: memory-map the .npy file (read-only) instead of reading it into memory.
+        """
+        if det_data is True:
+            if not hasattr(self, 'source_dir'):
+                raise ValueError("det_data=True needs an object created by RSM.load(); pass a path or array instead.")
+            det_data = os.path.join(self.source_dir, 'diff_data.npy')
+        if isinstance(det_data, (str, os.PathLike)):
+            det_data = np.load(det_data, mmap_mode='r' if mmap else None)
+        if det_data.shape[0] != self.num_angle or tuple(det_data.shape[-2:]) != tuple(self.X.shape[:2]):
+            raise ValueError(f"det_data shape {det_data.shape} does not match num_angle={self.num_angle} "
+                             f"and detector size {tuple(self.X.shape[:2])}.")
+        self.det_data = det_data
+        return self
+
     def run_interactive(self,scale='linear'):
         ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
         ims = np.stack(ims,axis=0)
@@ -1185,13 +1588,11 @@ class RSM:
             
         else:
             disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
-        if scale == 'log':
-            disp_data[-1] = np.log(disp_data[-1])
-            disp_data[-2] = np.log(disp_data[-2])
-        interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data)
+        transform = np.log if scale == 'log' else None  # applied per clicked slice to avoid full-size copies
+        interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data,transform=transform)
         return
     
-    def generate_movie(self, desc, path = None, scale='linear'):
+    def generate_movie(self, desc, path = None, scale='linear', fixed_row=None, fixed_col=None):
                   
         ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
         ims = np.stack(ims,axis=0)
@@ -1202,14 +1603,16 @@ class RSM:
             
         else:
             disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
-        if scale == 'log':
-            disp_data[-1] = np.log(disp_data[-1])
-            disp_data[-2] = np.log(disp_data[-2])
+        transform = np.log if scale == 'log' else None  # applied per frame to avoid full-size copies
         
         sz = np.shape(self.tot) 
         if path is None:
-            path = generate_row_col_list(0, sz[0], 0, sz[1], fixed_row=sz[0]//2, fixed_col=sz[1]//2)
-        create_movie(desc, names,im_stack,['qx vs qz','qy vs qz'],disp_data,path)
+            if fixed_row is None:
+                fixed_row = sz[0]//2
+            if fixed_col is None:
+                fixed_col = sz[1]//2
+            path = generate_row_col_list(0, sz[0], 0, sz[1], fixed_row=fixed_row, fixed_col=fixed_col)
+        create_movie(desc, names,im_stack,['qx vs qz','qy vs qz'],disp_data,path,transform=transform)
         return 
     
 def cen_of_mass(c):
@@ -1267,10 +1670,15 @@ def interactive_map(
     data_4D,
     cmap='jet',
     clim=None,
-    marker_color='black'
+    marker_color='black',
+    transform=None
 ):
     n = min(len(names), im_stack.shape[0])
     m = min(len(label),len(data_4D))
+
+    def slice_at(j, row, col):
+        img = data_4D[j][row, col]
+        return img if transform is None else transform(img)
 
     total = n + m
     ncols, nrows = 3, int(np.ceil(total / 3))
@@ -1290,7 +1698,7 @@ def interactive_map(
         ax.axis('off')
     for i in range(m):
         diff_ax = axs[n+i]
-        im = diff_ax.imshow(data_4D[i][0, 0], cmap=cmap, clim=clim, aspect='auto')
+        im = diff_ax.imshow(slice_at(i, 0, 0), cmap=cmap, clim=clim, aspect='auto')
         diff_ax.set_title(label, fontsize=9)
         diff_ax.axis('off')
         plt.show(block=False)
@@ -1320,19 +1728,28 @@ def interactive_map(
                 ax.set_title(names[i], fontsize=9)
             else:
                 j = i - n
-                ax.imshow(data_4D[j][row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.imshow(slice_at(j, row, col), cmap=cmap, clim=clim, aspect='auto')
                 ax.set_title(label[j], fontsize=9)
             ax.axis('off')
 
         # immediate redraw
         fig.canvas.draw()
 
+    def on_close(event):
+        # the callbacks keep the closure alive, so release the data explicitly
+        nonlocal data_4D, im_stack
+        data_4D = None
+        im_stack = None
+        for ax in axs:
+            ax.clear()
+
     # connect *after* layout
     fig.canvas.mpl_connect('button_press_event', onclick)
+    fig.canvas.mpl_connect('close_event', on_close)
 
     fig.show()
 
-def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color='white',clim=None):
+def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color='white',clim=None,transform=None):
     # desc: a dictionary. Example,
     # desc ={
     #    'title':'Movie',
@@ -1348,9 +1765,14 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
     # path: sampled positions for the movie, a list of [row, col]
     # cmap: color scheme of the plot
     # color: color of the marker
+    # transform: optional function applied to each displayed slice, e.g. np.log
     
     n = min(len(names), im_stack.shape[0])
     m = min(len(label),len(data_4D))
+
+    def slice_at(j, row, col):
+        img = data_4D[j][row, col]
+        return img if transform is None else transform(img)
 
     total = n + m
     ncols, nrows = 3, int(np.ceil(total / 3))
@@ -1370,7 +1792,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
         ax.axis('off')
     for i in range(m):
         diff_ax = axs[n+i]
-        im = diff_ax.imshow(data_4D[i][0, 0], cmap=cmap, clim=clim, aspect='auto')
+        im = diff_ax.imshow(slice_at(i, 0, 0), cmap=cmap, clim=clim, aspect='auto')
         diff_ax.set_title(label, fontsize=9)
         diff_ax.axis('off')
         plt.show(block=False)
@@ -1383,7 +1805,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
     
     fig.tight_layout()
     
-    def update_fig(row,col,cmap=cmap,color=color):
+    def update_fig(row,col,cmap=cmap,color=marker_color):
         
         plt.cla()
         for i, ax in enumerate(axs[:total]):
@@ -1394,7 +1816,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
                 ax.set_title(names[i], fontsize=9)
             else:
                 j = i - n
-                ax.imshow(data_4D[j][row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.imshow(slice_at(j, row, col), cmap=cmap, clim=clim, aspect='auto')
                 ax.set_title(label[j], fontsize=9)
             ax.axis('off')
         fig.tight_layout()
@@ -1410,7 +1832,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
         writer.grab_frame()
          
         for j in tqdm(range(len(path)),desc='Progress'):       
-            update_fig(path[j][0],path[j][1],cmap=cmap,color=color)
+            update_fig(path[j][0],path[j][1],cmap=cmap,color=marker_color)
             writer.grab_frame()
     writer.finish()
 
@@ -1544,18 +1966,38 @@ def fit_peaks(x, y, peak_type='gaussian', n_peaks=1, p0=None, bounds=(-np.inf, n
         print(f"Fit failed: {e}")
         return np.full_like(p0,np.nan), np.full_like(y, np.nan)
     
-def select_roi(image):
+def select_roi(image, output_path='', percentile=(1, 99.5), scale='log'):
     """
     Display an image and allow user to draw a rectangle to select ROI.
     
     Parameters:
         image (ndarray): 2D image array
+        output_path (str): directory prefix for the saved ROI images
+        percentile (tuple): (low, high) percentiles used as color limits so outlier pixels do not saturate the display;
+                            None uses the full min/max range
+        scale (str): 'linear' or 'log'; 'log' uses a log color scale (colorbar stays in image units),
+                     percentiles are taken over positive pixels and pixels <= 0 are drawn black
 
     Returns:
         roi (list): [row_start, col_start, row_width, col_width]
                     or None if no selection was made.
     """
+    if scale not in ('linear', 'log'):
+        raise ValueError("scale must be 'linear' or 'log'")
     roi_holder = {}
+    cmap = plt.get_cmap('jet').copy()
+    finite = image[np.isfinite(image)]
+    if scale == 'log':
+        cmap.set_bad('black')  # LogNorm masks values <= 0
+        finite = finite[finite > 0]
+    if percentile is None:
+        vmin, vmax = (finite.min(), finite.max()) if scale == 'log' else (None, None)
+    else:
+        vmin, vmax = np.percentile(finite, percentile)
+    if scale == 'log':
+        show_kw = dict(cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax))
+    else:
+        show_kw = dict(cmap=cmap, vmin=vmin, vmax=vmax)
 
     def on_select(eclick, erelease):
         x1, y1 = int(eclick.xdata), int(eclick.ydata)
@@ -1570,7 +2012,8 @@ def select_roi(image):
         print("Selected ROI:", roi_holder['roi'])
         
     fig, ax = plt.subplots()
-    ax.imshow(image, cmap='jet')
+    im = ax.imshow(image, **show_kw)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
     ax.set_title("Draw a rectangle to select ROI, then close the window")
 
     selector = RectangleSelector(
@@ -1586,7 +2029,30 @@ def select_roi(image):
     selector.set_active(True)
     plt.show(block=True)  # Waits for user interaction and window close
 
-    return roi_holder.get('roi', None)
+    roi = roi_holder.get('roi', None)
+    if roi is not None:
+        row_start, col_start, row_width, col_width = roi
+
+        if output_path and not os.path.exists(output_path):
+            os.makedirs(output_path)
+            print("Directory '%s' created" % output_path)
+
+        fig_full, ax_full = plt.subplots()
+        ax_full.imshow(image, **show_kw)
+        ax_full.add_patch(plt.Rectangle((col_start, row_start), col_width, row_width,
+                                        edgecolor='white', facecolor='none', linewidth=2))
+        ax_full.set_title(f"ROI: {roi}")
+        fig_full.savefig(f"{output_path}roi_{roi}.png", dpi=150, bbox_inches='tight')
+        plt.close(fig_full)
+
+        fig_crop, ax_crop = plt.subplots()
+        ax_crop.imshow(image[row_start:row_start + row_width,
+                             col_start:col_start + col_width], **show_kw)
+        ax_crop.set_title(f"ROI crop: {roi}")
+        fig_crop.savefig(f"{output_path}roi_crop_{roi}.png", dpi=150, bbox_inches='tight')
+        plt.close(fig_crop)
+
+    return roi
 
 def slider_view(im_stack):
     # Create figure and axes
@@ -1683,7 +2149,7 @@ def read_params_db(sid_list,microscope='mll',det='merlin1'):
     th_step = get_baseline_fields(db[sid_list[1]],[th_name])[th_name] - get_baseline_fields(db[sid_list[0]],[th_name])[th_name]
 
     if np.abs(th_step) < 1e-3:
-        print(f"{th_name} doesn't seem to change over scans.Please switch to another microscope for the correct theta stage")
+        print(f"{th_name} doesn't seem to change over scans. Please switch to another microscope for the correct theta stage")
 
     det_pix = det_param[det]
 
@@ -1741,11 +2207,11 @@ def generate_row_col_list(row_start, row_end, col_start, col_end, fixed_row=None
 
     # Case 1: vary row with fixed column
     if fixed_col is not None:
-        pairs.extend([[r, fixed_col] for r in range(row_start, row_end + 1)])
+        pairs.extend([[r, fixed_col] for r in range(row_start, row_end )])
 
     # Case 2: vary column with fixed row
     if fixed_row is not None:
-        pairs.extend([[fixed_row, c] for c in range(col_start, col_end + 1)])
+        pairs.extend([[fixed_row, c] for c in range(col_start, col_end )])
 
     return pairs  
 def bin_image(img, bins = 2):
