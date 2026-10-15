@@ -708,15 +708,22 @@ def process_5d_v1(subset, tmat, index):
     return v00[:,:,np.newaxis,np.newaxis] * lxly_subset + v10[:,:,np.newaxis,np.newaxis] * hxly_subset \
         + v01[:,:,np.newaxis,np.newaxis] * lxhy_subset + v11[:,:,np.newaxis,np.newaxis] * hxhy_subset
 
+def _get_executor(executor_type, max_workers):
+    if executor_type == 'thread':
+        return ThreadPoolExecutor(max_workers=max_workers)
+    if executor_type == 'process':
+        return ProcessPoolExecutor(max_workers=max_workers)
+    raise ValueError("executor_type must be 'thread' or 'process'.")
 
-def interp_sub_pix(data, shift_matrix, max_workers = 10):
+def interp_sub_pix(data, shift_matrix, max_workers = 10, executor_type = 'thread'):
     '''
     Parallelized function to apply sub-pixel shifts to 3D, 4D, or 5D data.
 
     Parameters:
         data (ndarray): Input data of shape (N, ...) where N is the first axis.
         shift_matrix (ndarray): Shift values corresponding to each slice.
-        max_workers (int): Number of parallel workers (default: 8).
+        max_workers (int): Number of parallel workers (default: 10).
+        executor_type (str): 'thread' (default) or 'process'.
 
     Returns:
         ndarray: Shifted data of the same shape as input.
@@ -736,7 +743,7 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     
     available_cores = os.cpu_count() or 1
     max_workers = min(max_workers, available_cores)
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with _get_executor(executor_type, max_workers) as executor:
         # Submit a task for each slice
         futures = {executor.submit(process_func, subset, shift_matrix, index): index for index, subset in enumerate(data)}
 
@@ -746,14 +753,15 @@ def interp_sub_pix(data, shift_matrix, max_workers = 10):
     
     return data
 
-def interp_sub_pix_v1(data, tmat, max_workers = 10):
+def interp_sub_pix_v1(data, tmat, max_workers = 10, executor_type = 'thread'):
     '''
     Parallelized function to apply sub-pixel shifts to 3D, 4D, or 5D data.
 
     Parameters:
         data (ndarray): Input data of shape (N, ...) where N is the first axis.
-        shift_matrix (ndarray): Shift values corresponding to each slice.
-        max_workers (int): Number of parallel workers (default: 8).
+        tmat (ndarray): Transform matrices corresponding to each slice.
+        max_workers (int): Number of parallel workers (default: 10).
+        executor_type (str): 'thread' (default) or 'process'.
 
     Returns:
         ndarray: Shifted data of the same shape as input.
@@ -773,7 +781,7 @@ def interp_sub_pix_v1(data, tmat, max_workers = 10):
     
     available_cores = os.cpu_count() or 1
     max_workers = min(max_workers, available_cores)
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+    with _get_executor(executor_type, max_workers) as executor:
         # Submit a task for each slice
         futures = {executor.submit(process_func, subset, tmat, index): index for index, subset in enumerate(data)}
 
