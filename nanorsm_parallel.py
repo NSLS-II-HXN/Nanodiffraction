@@ -1105,6 +1105,12 @@ def interp3_oblique(X, Y, Z, V, M, Vx, Vy, Vz):
     return Vq_flat.reshape(Vx.shape)
 
 
+def interp3_oblique_reduced(X, Y, Z, V, M, Vx, Vy, Vz):
+    vq = interp3_oblique(X, Y, Z, V, M, Vx, Vy, Vz)
+    qxz = np.sum(vq, axis=0)
+    qyz = np.sum(vq, axis=1)
+    del vq
+    return qxz, qyz
 
 
 class RSM:
@@ -1123,13 +1129,22 @@ class RSM:
         self.k = 1e4 / (12.398/energy)
         self.fluo_stack = fluo_stack
         self.fluo_names = fluo_names
-    def calcRSM(self, coor, data_store='reduced', desired_workers=10):
+    def calcRSM(self, coor, data_store='reduced', desired_workers=60, parallel_mode='thread', memory_safety=0.7, save_det_data=None):
     
         '''
         Calculate reciprocal space mapping (RSM) from the detector data.
         The bulk of the work is done by interpolating the transformed detector data
         onto a grid. Parallel processing is used to speed up the per-scan interpolation.
+        parallel_mode: 'thread' (ThreadPoolExecutor) or 'process' (ProcessPoolExecutor).
+        memory_safety: fraction of available memory the outputs and workers may use; outside [0, 1] disables the guard.
+        save_det_data: .npy path; if given, the input det_data is saved there before it is reshaped and later deleted.
         '''
+        if parallel_mode == 'thread':
+            Executor = ThreadPoolExecutor
+        elif parallel_mode == 'process':
+            Executor = ProcessPoolExecutor
+        else:
+            raise ValueError("parallel_mode must be 'thread' or 'process'")
         
         # --- Standard computations to set up matrices and grids ---
         sz = np.shape(self.det_data)
@@ -1194,11 +1209,27 @@ class RSM:
 
         # --- Reshape and prepare the detector data ---
         # self.det_data = np.squeeze(np.swapaxes(np.expand_dims(self.det_data, axis=-1), 0, -1), 0)
+        if save_det_data is not None:
+            np.save(save_det_data, self.det_data)  # raw [angle, ..., det_row, det_col] layout, as attach_det_data expects
         self.det_data = np.moveaxis(self.det_data, 0, -1)
 
         sz = np.shape(self.det_data)
         self.det_data = np.reshape(self.det_data, [-1, sz[-3], sz[-2], sz[-1]])
         new_sz = np.shape(self.det_data)
+
+        # --- Memory guard: preallocated outputs plus per-task interpolation temporaries ---
+        n_vox = int(np.prod(trans_sz))
+        if data_store == 'full':
+            output_bytes = new_sz[0] * n_vox * 4
+        else:
+            output_bytes = new_sz[0] * (trans_sz[0] + trans_sz[1]) * trans_sz[2] * 4
+        per_task_bytes = 25 * n_vox * 4  # about 25 float32/int32 arrays of grid size live in interp3_oblique
+        if 0 <= memory_safety <= 1:
+            budget = psutil.virtual_memory().available * memory_safety
+            if output_bytes > budget:
+                raise MemoryError(f"calcRSM output needs ~{output_bytes/1e9:.1f} GB but only {budget/1e9:.1f} GB "
+                                  f"is allowed ({memory_safety:.0%} of available). Use data_store='reduced', "
+                                  f"a larger bins, or a smaller roi.")
 
         if data_store == 'full':
             self.full_data = np.zeros((new_sz[0], trans_sz[0], trans_sz[1], trans_sz[2]),
@@ -1211,20 +1242,37 @@ class RSM:
         # Determine number of workers; if desired_workers is unspecified, use available cores.
         available_cores = os.cpu_count() or 1
         max_workers = min(desired_workers, available_cores)
-        
+        max_workers = _cap_workers_by_memory(max_workers, per_task_bytes, safety=memory_safety,
+                                             overhead=1.0 if parallel_mode == 'thread' else 2.0,
+                                             reserve_bytes=output_bytes)
 
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = {executor.submit(interp3_oblique, X, Y, Z, self.det_data[i, :, :, :],
-                                 M_inv, xq, yq, zq): i for i in range(new_sz[0])}
-            for future in tqdm(as_completed(futures), total=new_sz[0],
-                               desc="Processing scans in parallel"):
-                idx = futures[future]
-                vq = future.result()
-                if data_store == 'full':
-                    self.full_data[idx, :, :, :] = vq
-                else:
-                    self.qxz_data[idx, :, :] = np.sum(vq, axis=0)
-                    self.qyz_data[idx, :, :] = np.sum(vq, axis=1)
+        # Threads share memory (numpy releases the GIL); processes pickle inputs/results per task.
+        chunk_size = max_workers
+        with Executor(max_workers=max_workers) as executor:
+            with tqdm(total=new_sz[0], desc="Processing scans in parallel") as pbar:
+                for batch_start in range(0, new_sz[0], chunk_size):
+                    batch_end = min(batch_start + chunk_size, new_sz[0])
+                    if data_store == 'full':
+                        futures = {executor.submit(interp3_oblique, X, Y, Z, self.det_data[i, :, :, :],
+                                     M_inv, xq, yq, zq): i for i in range(batch_start, batch_end)}
+                    else:
+                        futures = {executor.submit(interp3_oblique_reduced, X, Y, Z, self.det_data[i, :, :, :],
+                                     M_inv, xq, yq, zq): i for i in range(batch_start, batch_end)}
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        if data_store == 'full':
+                            vq = future.result()
+                            self.full_data[idx, :, :, :] = vq
+                            del vq
+                        else:
+                            qxz, qyz = future.result()
+                            self.qxz_data[idx, :, :] = qxz
+                            self.qyz_data[idx, :, :] = qyz
+                            del qxz, qyz
+                        del futures[future]
+                        pbar.update(1)
+                    del futures
+                    gc.collect()
 
         # --- Save grid and metadata ---
         self.xq = xq
