@@ -36,6 +36,7 @@ import warnings
 import pandas as pd
 import json
 import multiprocessing as mp
+import psutil
 
 global db_key
 db_key = 'new'
@@ -308,30 +309,39 @@ def load_h5_data(file_list, roi, mask):
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
     return diff_data 
 
-def load_h5_data_single(file_name,data_name,roi,mask,threshold):
+def load_h5_data_single(file_name,data_name,roi,mask,threshold,bins=1,flip=True):
     # Each thread will open a file, process it and return the index, data, and raw-size.
     # Using a context manager ensures the file is closed.
-    with h5py.File(file_name[0], 'r') as f:
-        dset = np.asarray(f[data_name])
-        # Read the full dataset (or use slices if desired)
-        # Multiply by the mask if one is provided.
-        if mask is None:
-            data = dset[...]
-        else:
-            data = dset[...] * mask
-        # Apply ROI if provided; else flip the full dataset.
+    with h5py.File(file_name, 'r', locking=False) as f:
+        dset = f[data_name]
         if roi is None:
-            data = np.flip(data[:,:,:], axis=1)
+            rs, cs = slice(None), slice(None)
         else:
-            data = np.flip(data[:, roi[0]:roi[0]+roi[2], roi[1]:roi[1]+roi[3]], axis=1)
-        raw_size = np.shape(dset)
+            rs, cs = slice(roi[0], roi[0] + roi[2]), slice(roi[1], roi[1] + roi[3])
+        n, nr, nc = dset.shape
+        shape = (n, len(range(*rs.indices(nr))), len(range(*cs.indices(nc))))
+        # float32 avoids integer overflow when summing pixels of raw integer frames
+        data = np.empty(shape, dtype=np.float32)
+        dset.read_direct(data, source_sel=(slice(None), rs, cs))
+    if mask is not None:
+        data *= mask[rs, cs]
+    if bins > 1:
+        data = np.array([bin_image(frame, bins) for frame in data])
+    if flip:
+        data = np.flip(data, axis=1)
     if threshold is not None:
         data[data < threshold[0]] = 0
         data[data > threshold[1]] = 0
     return data
 
+def _estimate_h5_task_bytes(file_name, data_name, roi=None):
+    with h5py.File(file_name, 'r', locking=False) as f:
+        n, rows, cols = f[data_name].shape
+    if roi is not None:
+        rows, cols = roi[2], roi[3]
+    return n * rows * cols * 4  # float32 ROI buffer read by one worker
 
-def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None):
+def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None, h5_type='diff_view', bins=1, max_workers=10, memory_safety=0.7):
     """
     Load a list of HDF5 (h5) files, apply optional ROI and mask,
     flip the data along axis=1, and stack the results along the first axis.
@@ -340,24 +350,39 @@ def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None):
     roi: [row_start, col_start, row_size, col_size] or None
     mask: an array of the same shape as each image data, or None.
     threshold: set pixel outside the bound [low, high] to zero, or None 
+    h5_type: 'diff_view' for files exported from diff_view, otherwise raw detector files
+    bins: binning factor applied to each frame after the ROI crop
+    max_workers: upper limit on worker processes; further reduced to fit available memory
+    memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is
     """
     data_type = 'float32'
     num_scans = len(file_list)
-    data_name = '/entry/instrument/detector/data'
+    if h5_type == 'diff_view':
+        data_name = '/diff_data/merlin1/det_images' # for h5 files exported from diff_view
+    else:
+        data_name = '/entry/instrument/detector/data' # for h5 raw data
 
 
+    if file_list is None or len(file_list) == 0:
+        raise ValueError("file_list is empty or None.")
 
-    # Create a list to hold results (preserving file order)
-    results = [None] * num_scans
+    max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = _cap_workers_by_memory(max_workers, _estimate_h5_task_bytes(file_list[0], data_name, roi), safety=memory_safety)
+    ctx = mp.get_context("spawn")
 
-    # Launch threads to process each file concurrently.
-    with ProcessPoolExecutor() as executor:
-        # Create a dictionary mapping futures to index
-        futures = {executor.submit(load_h5_data_single, file_list[i],data_name,roi,mask,threshold): i for i in range(num_scans)}
+    results = None  # allocated on the first result to avoid a second full-size copy
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = {executor.submit(load_h5_data_single, file_list[i],data_name,roi,mask,threshold,bins): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
-            results[idx] = future.result()
-    results = np.stack(results)
+            try:
+                result = future.result()
+                if results is None:
+                    results = np.zeros((num_scans,) + result.shape, dtype=result.dtype)
+                results[idx] = result
+                del result
+            except Exception as e:
+                print(f"Error processing file index {idx}: {e}")
 
     # If there is only one scan, assume a rocking curve scan and swap axes.
     if num_scans == 1:
@@ -410,7 +435,23 @@ def load_h5_data_db(sid,det,mon=None,roi=None,mask=None,threshold=None):
         # Resize (if necessary) and return the processed scan.
         return proc_data
 
-def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, bins=1):
+def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, bins=1, flip=True):
+    """
+    Load HDF5 data from the database with optional ROI, mask, thresholding, and binning.
+
+    Parameters:
+        sid (int): Scan ID.
+        det (str): Detector name.
+        mon (str, optional): Monitor channel for normalization.
+        roi (tuple, optional): Region of interest (r0, c0, rsz, csz) for each frame.
+        mask (ndarray, optional): Mask to apply to the data for the scan region.
+        threshold (tuple, optional): Threshold values (min, max).
+        bins (int, optional): Binning factor (default is 1).
+        flip (bool, optional): Flip vertically (axis=1) before returning (default is True).
+
+    Returns:
+        ndarray: Processed data array.
+    """
 
 
     sid = int(sid)
@@ -440,7 +481,7 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, 
 
             dset.read_direct(temp, source_sel=roi_slices)
             if bins > 1:
-                temp = np.array([bin_image(frame, 2) for frame in temp])
+                temp = np.array([bin_image(frame, bins) for frame in temp])
 
             data_blocks.append(temp)
 
@@ -465,13 +506,36 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, 
         data *= mask
 
     # Flip vertically (along axis=1)
-    proc_data = np.flip(data, axis=1)
+    proc_data = np.flip(data, axis=1) if flip else data
 
     return proc_data
 
+def _cap_workers_by_memory(max_workers, per_task_bytes, safety=0.7, overhead=2.0, reserve_bytes=0):
+    # overhead covers temporaries and the pickled result copy held while a task finishes
+    # reserve_bytes is memory already promised elsewhere, e.g. arrays allocated but not yet touched
+    if safety > 1 or safety < 0:  # out-of-range disables the guard
+        return max_workers
+    avail = psutil.virtual_memory().available
+    n_fit = int((avail * safety - reserve_bytes) // (per_task_bytes * overhead))
+    capped = max(1, min(max_workers, n_fit))
+    if capped < max_workers:
+        print(f"Memory guard: max_workers reduced from {max_workers} to {capped} "
+              f"({avail/1e9:.1f} GB available, ~{per_task_bytes/1e9:.2f} GB per task).")
+    return capped
 
+def _estimate_scan_bytes(sid, det, roi=None):
+    file_names = get_path(int(sid), det)
+    if not isinstance(file_names, list):
+        file_names = [file_names]
+    frames = 0
+    for fname in file_names:
+        with h5py.File(fname, 'r', locking=False) as f:
+            shape = f['/entry/instrument/detector/data'].shape
+        frames += shape[0]
+    rows, cols = (shape[1], shape[2]) if roi is None else (roi[2], roi[3])
+    return frames * rows * cols * 4
 
-def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers = 10):
+def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers = 10, memory_safety=0.7):
     """
     Load diffraction data from a list of scans (given by sid_list) through databroker
     with data being stacked along the first axis.
@@ -483,6 +547,9 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
       roi: a list of [row_start, col_start, row_size, col_size]. If None, the full image is used.
       mask: an array to be multiplied with the detector data. Must be of appropriate shape.
       threshold: two-element list [lower, upper] to clip pixel values.
+      bins (int): Binning factor for each frame.
+      max_workers: upper limit on worker processes; further reduced to fit available memory.
+      memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is.
       
     Returns:
       diff_data: stacked diffraction data with shape (num_scans, frames, row, col)
@@ -490,22 +557,26 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
     """
     num_scans = np.size(sid_list)
     
-    diff_data = [None]*num_scans
+    diff_data = None  # allocated on the first result to avoid a second full-size copy
     # === Process scans 1...num_scans-1 concurrently ===
     num_cores = os.cpu_count() or 1
     max_workers = min(max_workers, num_cores)
+    max_workers = _cap_workers_by_memory(max_workers, _estimate_scan_bytes(sid_list[0], det, roi), safety=memory_safety)
     ctx = mp.get_context("spawn") #ensure to create a new db session for each subprocess to be fork-safe
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
         futures = {executor.submit(load_h5_data_db_v1, sid_list[i],det, mon,roi,mask,threshold, bins): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
             try:
-                diff_data[idx] = future.result()
+                result = future.result()
+                if diff_data is None:
+                    diff_data = np.zeros((num_scans,) + result.shape, dtype=result.dtype)
+                diff_data[idx] = result
+                del result
             except Exception as e:
-                print(f"Error processing scan index {i}: {e}")
+                print(f"Error processing scan index {idx}: {e}")
     
     # If only one scan was loaded, assume a rocking curve scan: swap axes.
-    diff_data = np.asarray(diff_data)
     if num_scans == 1:
         diff_data = np.swapaxes(diff_data, 0, 1)
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
