@@ -8,6 +8,7 @@ import tifffile
 import h5py
 from scipy.optimize import curve_fit
 from scipy.special import wofz  # For Voigt
+from scipy import ndimage
 #import csv
 from tqdm.auto import tqdm
 from mpl_toolkits.axes_grid1 import make_axes_locatable
@@ -93,6 +94,19 @@ def get_sid_list(str_list, interval):
 #     return im_stack
 
 def load_ims(file_list):
+    """
+    Load a stack of TIFF images and center-pad them to the same dimensions.
+
+    Parameters
+    ----------
+    file_list : list of str
+        List of file paths to the TIFF images.
+
+    Returns
+    -------
+    im_stack : np.ndarray
+        3D array containing the stacked images with shape (num_ims, max_row, max_col).
+    """
     # First pass: determine max image size
     max_row, max_col = 0, 0
     for fname in file_list:
@@ -118,6 +132,19 @@ def load_ims(file_list):
 
 
 def load_txts(file_list):
+    """
+    Load a stack of text-based images (e.g., .txt files) and center-pad them to the same dimensions.
+
+    Parameters
+    ----------
+    file_list : list of str
+        List of file paths to the text-based images.
+
+    Returns
+    -------
+    im_stack : np.ndarray
+        3D array containing the stacked images with shape (num_ims, max_row, max_col).
+    """
     # stacking is along the first axis
     num_ims = np.size(file_list)
     for i in tqdm(range(num_ims),desc="Progress"):
@@ -149,15 +176,76 @@ def load_txts(file_list):
 
 def create_file_list(data_path, prefix, postfix, sid_list):
     num = np.size(sid_list)
-    file_list = []
-    for sid in sid_list:
-        # tmp = ''.join([data_path, prefix,'{}'.format(sid),postfix])
-        tmp = f"{data_path}{prefix}{sid}{postfix}"
-        file_list.append(tmp)
+    file_list = [f"{data_path}{prefix}{sid}{postfix}" for sid in sid_list]
     return file_list
 
+def get_fluorescence_image_dimensions(data_path, sid_list, elem_list):
+    """
+    Read the first available fluorescence image to determine target dimensions.
+    
+    Parameters
+    ----------
+    data_path : str
+        Path to the XRF data directory (e.g., '//data//users//2026Q2//Sun_2026Q2//xrf//')
+    sid_list : array-like
+        List of scan IDs
+    elem_list : list
+        List of element names (e.g., ['Fe_K', 'Cr_K'])
+    
+    Returns
+    -------
+    tuple
+        (target_height, target_width) dimensions of the fluorescence images
+    """
+    # Try each element and sid combination to find first available file
+    for elem in elem_list:
+        for sid in sid_list:
+            test_file = f"{data_path}output_tiff_scan2D_{sid}//detsum_{elem}_norm.tiff"
+            if os.path.exists(test_file):
+                try:
+                    im = tifffile.imread(test_file)
+                    height, width = im.shape
+                    print(f"Detected fluorescence image dimensions from {test_file}: {height}x{width}")
+                    return (height, width)
+                except Exception as e:
+                    print(f"Error reading {test_file}: {e}")
+                    continue
+    raise FileNotFoundError(f"Could not find any valid fluorescence image in {data_path}")
 
 
+def downsample_image_stack(im_stack, target_shape):
+    """
+    Downsample (or upsample) image stack to target dimensions using cubic interpolation.
+    
+    Parameters
+    ----------
+    im_stack : ndarray
+        Image stack with shape (num_frames, height, width)
+    target_shape : tuple
+        Target dimensions (target_height, target_width)
+    
+    Returns
+    -------
+    ndarray
+        Downsampled image stack with shape (num_frames, target_height, target_width)
+    """
+    num_frames, curr_height, curr_width = im_stack.shape
+    target_height, target_width = target_shape
+    
+    # Calculate zoom factors for each dimension
+    zoom_factors = (
+        1.0,  # no scaling along frame axis
+        target_height / curr_height,
+        target_width / curr_width
+    )
+    
+    # Apply zoom using cubic interpolation (order=3)
+    im_stack_downsampled = ndimage.zoom(im_stack, zoom_factors, order=3)
+    
+    print(f"Downsampled from {curr_height}x{curr_width} to {target_height}x{target_width}")
+    print(f"Image stack shape: {im_stack.shape} → {im_stack_downsampled.shape}")
+    
+    return im_stack_downsampled.astype(im_stack.dtype)
 
 def align_im_stack(im_stack):
     # default stacking axis is zero
@@ -695,7 +783,25 @@ def interp_sub_pix_v1(data, tmat, max_workers = 10):
     
     return data
 
+def save_aligned_stack(im_stack, trans_matrix, output_path, name):
+    """Apply the alignment in place, save the stack as <output_path><name>.tiff, and return (stack, summed image)."""
+    im_stack = interp_sub_pix_v1(im_stack, trans_matrix)
+    imp = np.sum(im_stack, axis=0)
+    tifffile.imwrite(f"{output_path}{name}.tiff", im_stack.astype(np.float32), imagej=True)
+    print(f"save {name} to {output_path}{name}.tiff")
+    return im_stack, imp
 
+def save_ims(file_list, trans_matrix, output_path, name, flip_axis=None, target_shape=None):
+    """
+    Load the images in file_list, optionally flip along flip_axis and downsample to target_shape,
+    then align and save them with save_aligned_stack. Returns (aligned stack, summed image).
+    """
+    im_stack = load_ims(file_list)
+    if flip_axis is not None:
+        im_stack = np.flip(im_stack, axis=flip_axis)
+    if target_shape is not None:
+        im_stack = downsample_image_stack(im_stack, target_shape)
+    return save_aligned_stack(im_stack, trans_matrix, output_path, name)
 
 def trans_coor3D(X, Y, Z, M):
     '''Transform coordinates (X,Y,Z) by 3x3 matrix M (e.g., rotation/transform).'''
