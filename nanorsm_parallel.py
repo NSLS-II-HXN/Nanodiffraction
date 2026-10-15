@@ -1444,22 +1444,24 @@ class RSM:
 
         #plt.savefig('./result.png')
               
-    def save(self,output_path):
+    def save(self,output_path,file_name=None):
+        # file_name is a prefix (e.g. 'scan123' -> 'scan123_strain_map.tif'); None keeps the default names
+        prefix = '' if file_name is None else f'{file_name}_'
 
         if not os.path.exists(output_path):
             os.mkdir(output_path)
             print("Directory '%s' created" %output_path)
         
-        file_name = ''.join([output_path,'tot_intensity_map.tif'])
-        tifffile.imsave(file_name,np.asarray(self.tot,dtype=np.float32),imagej=True)
+        file_name = ''.join([output_path,prefix,'tot_intensity_map.tif'])
+        tifffile.imwrite(file_name,np.asarray(self.tot,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'strain_map.tif'])
+        file_name = ''.join([output_path,prefix,'strain_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.strain,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'tilt_x_map.tif'])
+        file_name = ''.join([output_path,prefix,'tilt_x_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.tilt_x,dtype=np.float32),imagej=True)
 
-        file_name = ''.join([output_path,'tilt_y_map.tif'])
+        file_name = ''.join([output_path,prefix,'tilt_y_map.tif'])
         tifffile.imwrite(file_name,np.asarray(self.tilt_y,dtype=np.float32),imagej=True)
 
         # file_name = ''.join([output_path,'pos_rsm_xz.obj'])
@@ -1492,7 +1494,40 @@ class RSM:
         file_name = f"{output_path}all.obj"
         pickle.dump(self,open(file_name,'wb'),protocol = 4)
 
+    @classmethod
+    def load(cls, file_name=None, det_data=None, mmap=False):
+        # file_name may be an all.obj path or a directory containing it; None opens a file dialog
+        # det_data: array, .npy path, or True to also load diff_data.npy next to all.obj (see attach_det_data)
+        if file_name is None:
+            file_name = select_file()
+        elif os.path.isdir(file_name):
+            file_name = os.path.join(file_name, 'all.obj')
+        with open(file_name, 'rb') as f:
+            obj = pickle.load(f)
+        if not isinstance(obj, cls):
+            raise TypeError(f"{file_name} does not contain an RSM object.")
+        obj.source_dir = os.path.dirname(os.path.abspath(file_name))
+        if det_data is not None:
+            obj.attach_det_data(det_data, mmap=mmap)
+        return obj
 
+    def attach_det_data(self, det_data=True, mmap=False):
+        """
+        Restore the raw detector data [angle, ..., det_row, det_col] that calcRSM deletes.
+        det_data: array, path to a .npy file, or True for diff_data.npy in the folder all.obj was loaded from.
+        mmap: memory-map the .npy file (read-only) instead of reading it into memory.
+        """
+        if det_data is True:
+            if not hasattr(self, 'source_dir'):
+                raise ValueError("det_data=True needs an object created by RSM.load(); pass a path or array instead.")
+            det_data = os.path.join(self.source_dir, 'diff_data.npy')
+        if isinstance(det_data, (str, os.PathLike)):
+            det_data = np.load(det_data, mmap_mode='r' if mmap else None)
+        if det_data.shape[0] != self.num_angle or tuple(det_data.shape[-2:]) != tuple(self.X.shape[:2]):
+            raise ValueError(f"det_data shape {det_data.shape} does not match num_angle={self.num_angle} "
+                             f"and detector size {tuple(self.X.shape[:2])}.")
+        self.det_data = det_data
+        return self
 
     def run_interactive(self,scale='linear'):
         ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
