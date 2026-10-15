@@ -157,6 +157,8 @@ def create_file_list(data_path, prefix, postfix, sid_list):
     return file_list
 
 
+
+
 def align_im_stack(im_stack):
     # default stacking axis is zero
     #im_stack = np.moveaxis(im_stack,2,0)
@@ -192,7 +194,8 @@ def load_h5_data(file_list, roi, mask):
     data_type = 'float32'
     
     num_scans = np.size(file_list)
-    det = '/entry/instrument/detector/data'
+    #det = '/entry/instrument/detector/data'
+    det = '/diff_data/merlin1/det_images'
     for i in tqdm(range(num_scans),desc="Progress"):
         file_name = file_list[i]
         f = h5py.File(file_name,'r')       
@@ -238,6 +241,7 @@ def load_h5_data_single(file_name,data_name,roi,mask,threshold):
         data[data < threshold[0]] = 0
         data[data > threshold[1]] = 0
     return data
+
 
 def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None):
     """
@@ -377,6 +381,8 @@ def load_h5_data_db_v1(sid, det, mon=None, roi=None, mask=None, threshold=None, 
 
     return proc_data
 
+
+
 def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers = 10):
     """
     Load diffraction data from a list of scans (given by sid_list) through databroker
@@ -417,6 +423,10 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
     
     return diff_data
+
+
+
+
 
 def load_and_sum_db(sid, det):
         sid = int(sid)
@@ -493,28 +503,8 @@ def sum_all_h5_data_db_parallel(sid_list, det, max_workers=10):
     return scan_sum_list
 
 
-def load_and_sum(file_name):
-    dataset_path='/entry/instrument/detector/data'
-    with h5py.File(file_name[0], 'r') as f:
-        data = np.asarray(f[dataset_path])
-    return np.sum(data, axis=0)  # sum along time or scan axis
 
 
-def sum_all_h5_data_parallel(file_list):
-    num_scans = len(file_list)
-    results = [None]*num_scans
-    
-    with ProcessPoolExecutor(max_workers = 10) as executor:
-        # Submit all tasks to the pool
-        futures = {executor.submit(load_and_sum, file_list[i]): i for i in range(num_scans)}
-        for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):           
-            idx = futures[future]
-            results[idx] = future.result()  
-
-    # Sum all partial results
-    results = np.stack(results)
-    sum_all_data = np.sum(results, axis=0)
-    return sum_all_data
 
 
 def process_3d(subset, shift_matrix, index):
@@ -589,18 +579,13 @@ def process_4d_v1(subset, tmat, index):
     # inv_t = np.linalg.inv(t)
     sz = np.shape(subset)
     x = np.linspace(0,sz[0],sz[0],False)
-    
-#     p = p + u
-    trans_x = t*p + u
-    
-    lx = np.clip(np.floor(trans_x),0,sz[1]-1).astype(int)
-    hx = np.clip(np.ceil(trans_x),0,sz[1]-1).astype(int)
-    lx_subset = subset[lx]
-    hx_subset = subset[hx]
-     
-    rx = trans_x - lx
-     
-    return (1 - rx) * lx_subset + rx * hx_subset 
+    trans_x = t*x + u
+
+    lx = np.clip(np.floor(trans_x),0,sz[0]-1).astype(int)
+    hx = np.clip(np.ceil(trans_x),0,sz[0]-1).astype(int)
+    rx = (trans_x - lx).reshape((-1,) + (1,)*(subset.ndim-1))
+
+    return (1 - rx) * subset[lx] + rx * subset[hx]
 
 
 def process_5d_v1(subset, tmat, index):
@@ -634,6 +619,7 @@ def process_5d_v1(subset, tmat, index):
 
     return v00[:,:,np.newaxis,np.newaxis] * lxly_subset + v10[:,:,np.newaxis,np.newaxis] * hxly_subset \
         + v01[:,:,np.newaxis,np.newaxis] * lxhy_subset + v11[:,:,np.newaxis,np.newaxis] * hxhy_subset
+
 
 def interp_sub_pix(data, shift_matrix, max_workers = 10):
     '''
@@ -708,6 +694,8 @@ def interp_sub_pix_v1(data, tmat, max_workers = 10):
             data[idx] = future.result()
     
     return data
+
+
 
 def trans_coor3D(X, Y, Z, M):
     '''Transform coordinates (X,Y,Z) by 3x3 matrix M (e.g., rotation/transform).'''
@@ -788,6 +776,8 @@ def interp3_oblique(X, Y, Z, V, M, Vx, Vy, Vz):
     Vq_flat = V000 * inv_rx * inv_ry * inv_rz + V100 * rX * inv_ry * inv_rz + V010 * inv_rx * rY * inv_rz + V110 * rX * rY * inv_rz + V001 * inv_rx * inv_ry * rZ + V101 * rX * inv_ry * rZ + V011 * inv_rx * rY * rZ + V111 * rX * rY * rZ
     Vq_flat *= mask
     return Vq_flat.reshape(Vx.shape)
+
+
 
 
 class RSM:
@@ -1174,6 +1164,8 @@ class RSM:
             plt.savefig(file_name)
         file_name = f"{output_path}all.obj"
         pickle.dump(self,open(file_name,'wb'),protocol = 4)
+
+
 
     def run_interactive(self,scale='linear'):
         ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
@@ -1741,11 +1733,11 @@ def generate_row_col_list(row_start, row_end, col_start, col_end, fixed_row=None
 
     # Case 1: vary row with fixed column
     if fixed_col is not None:
-        pairs.extend([[r, fixed_col] for r in range(row_start, row_end + 1)])
+        pairs.extend([[r, fixed_col] for r in range(row_start, row_end )])
 
     # Case 2: vary column with fixed row
     if fixed_row is not None:
-        pairs.extend([[fixed_row, c] for c in range(col_start, col_end + 1)])
+        pairs.extend([[fixed_row, c] for c in range(col_start, col_end )])
 
     return pairs  
 def bin_image(img, bins = 2):
