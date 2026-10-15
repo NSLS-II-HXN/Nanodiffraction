@@ -2,6 +2,7 @@ import numpy as np
 from pystackreg import StackReg
 import matplotlib.pyplot as plt
 from matplotlib.widgets import RectangleSelector
+from matplotlib.colors import LogNorm
 import matplotlib.animation as manimation
 from matplotlib.widgets import Slider
 import tifffile
@@ -1587,13 +1588,11 @@ class RSM:
             
         else:
             disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
-        if scale == 'log':
-            disp_data[-1] = np.log(disp_data[-1])
-            disp_data[-2] = np.log(disp_data[-2])
-        interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data)
+        transform = np.log if scale == 'log' else None  # applied per clicked slice to avoid full-size copies
+        interactive_map(names,im_stack,['qx vs qz','qy vs qz'],disp_data,transform=transform)
         return
     
-    def generate_movie(self, desc, path = None, scale='linear'):
+    def generate_movie(self, desc, path = None, scale='linear', fixed_row=None, fixed_col=None):
                   
         ims = [self.tot,self.strain,self.tilt_x,self.tilt_y]
         ims = np.stack(ims,axis=0)
@@ -1604,14 +1603,16 @@ class RSM:
             
         else:
             disp_data = [np.swapaxes(self.qxz_data,-1,-2),np.swapaxes(self.qyz_data,-1,-2)]
-        if scale == 'log':
-            disp_data[-1] = np.log(disp_data[-1])
-            disp_data[-2] = np.log(disp_data[-2])
+        transform = np.log if scale == 'log' else None  # applied per frame to avoid full-size copies
         
         sz = np.shape(self.tot) 
         if path is None:
-            path = generate_row_col_list(0, sz[0], 0, sz[1], fixed_row=sz[0]//2, fixed_col=sz[1]//2)
-        create_movie(desc, names,im_stack,['qx vs qz','qy vs qz'],disp_data,path)
+            if fixed_row is None:
+                fixed_row = sz[0]//2
+            if fixed_col is None:
+                fixed_col = sz[1]//2
+            path = generate_row_col_list(0, sz[0], 0, sz[1], fixed_row=fixed_row, fixed_col=fixed_col)
+        create_movie(desc, names,im_stack,['qx vs qz','qy vs qz'],disp_data,path,transform=transform)
         return 
     
 def cen_of_mass(c):
@@ -1669,10 +1670,15 @@ def interactive_map(
     data_4D,
     cmap='jet',
     clim=None,
-    marker_color='black'
+    marker_color='black',
+    transform=None
 ):
     n = min(len(names), im_stack.shape[0])
     m = min(len(label),len(data_4D))
+
+    def slice_at(j, row, col):
+        img = data_4D[j][row, col]
+        return img if transform is None else transform(img)
 
     total = n + m
     ncols, nrows = 3, int(np.ceil(total / 3))
@@ -1692,7 +1698,7 @@ def interactive_map(
         ax.axis('off')
     for i in range(m):
         diff_ax = axs[n+i]
-        im = diff_ax.imshow(data_4D[i][0, 0], cmap=cmap, clim=clim, aspect='auto')
+        im = diff_ax.imshow(slice_at(i, 0, 0), cmap=cmap, clim=clim, aspect='auto')
         diff_ax.set_title(label, fontsize=9)
         diff_ax.axis('off')
         plt.show(block=False)
@@ -1722,19 +1728,28 @@ def interactive_map(
                 ax.set_title(names[i], fontsize=9)
             else:
                 j = i - n
-                ax.imshow(data_4D[j][row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.imshow(slice_at(j, row, col), cmap=cmap, clim=clim, aspect='auto')
                 ax.set_title(label[j], fontsize=9)
             ax.axis('off')
 
         # immediate redraw
         fig.canvas.draw()
 
+    def on_close(event):
+        # the callbacks keep the closure alive, so release the data explicitly
+        nonlocal data_4D, im_stack
+        data_4D = None
+        im_stack = None
+        for ax in axs:
+            ax.clear()
+
     # connect *after* layout
     fig.canvas.mpl_connect('button_press_event', onclick)
+    fig.canvas.mpl_connect('close_event', on_close)
 
     fig.show()
 
-def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color='white',clim=None):
+def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color='white',clim=None,transform=None):
     # desc: a dictionary. Example,
     # desc ={
     #    'title':'Movie',
@@ -1750,9 +1765,14 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
     # path: sampled positions for the movie, a list of [row, col]
     # cmap: color scheme of the plot
     # color: color of the marker
+    # transform: optional function applied to each displayed slice, e.g. np.log
     
     n = min(len(names), im_stack.shape[0])
     m = min(len(label),len(data_4D))
+
+    def slice_at(j, row, col):
+        img = data_4D[j][row, col]
+        return img if transform is None else transform(img)
 
     total = n + m
     ncols, nrows = 3, int(np.ceil(total / 3))
@@ -1772,7 +1792,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
         ax.axis('off')
     for i in range(m):
         diff_ax = axs[n+i]
-        im = diff_ax.imshow(data_4D[i][0, 0], cmap=cmap, clim=clim, aspect='auto')
+        im = diff_ax.imshow(slice_at(i, 0, 0), cmap=cmap, clim=clim, aspect='auto')
         diff_ax.set_title(label, fontsize=9)
         diff_ax.axis('off')
         plt.show(block=False)
@@ -1785,7 +1805,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
     
     fig.tight_layout()
     
-    def update_fig(row,col,cmap=cmap,color=color):
+    def update_fig(row,col,cmap=cmap,color=marker_color):
         
         plt.cla()
         for i, ax in enumerate(axs[:total]):
@@ -1796,7 +1816,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
                 ax.set_title(names[i], fontsize=9)
             else:
                 j = i - n
-                ax.imshow(data_4D[j][row, col], cmap=cmap, clim=clim, aspect='auto')
+                ax.imshow(slice_at(j, row, col), cmap=cmap, clim=clim, aspect='auto')
                 ax.set_title(label[j], fontsize=9)
             ax.axis('off')
         fig.tight_layout()
@@ -1812,7 +1832,7 @@ def create_movie(desc, names,im_stack,label,data_4D,path,cmap='jet',marker_color
         writer.grab_frame()
          
         for j in tqdm(range(len(path)),desc='Progress'):       
-            update_fig(path[j][0],path[j][1],cmap=cmap,color=color)
+            update_fig(path[j][0],path[j][1],cmap=cmap,color=marker_color)
             writer.grab_frame()
     writer.finish()
 
@@ -1946,18 +1966,38 @@ def fit_peaks(x, y, peak_type='gaussian', n_peaks=1, p0=None, bounds=(-np.inf, n
         print(f"Fit failed: {e}")
         return np.full_like(p0,np.nan), np.full_like(y, np.nan)
     
-def select_roi(image):
+def select_roi(image, output_path='', percentile=(1, 99.5), scale='log'):
     """
     Display an image and allow user to draw a rectangle to select ROI.
     
     Parameters:
         image (ndarray): 2D image array
+        output_path (str): directory prefix for the saved ROI images
+        percentile (tuple): (low, high) percentiles used as color limits so outlier pixels do not saturate the display;
+                            None uses the full min/max range
+        scale (str): 'linear' or 'log'; 'log' uses a log color scale (colorbar stays in image units),
+                     percentiles are taken over positive pixels and pixels <= 0 are drawn black
 
     Returns:
         roi (list): [row_start, col_start, row_width, col_width]
                     or None if no selection was made.
     """
+    if scale not in ('linear', 'log'):
+        raise ValueError("scale must be 'linear' or 'log'")
     roi_holder = {}
+    cmap = plt.get_cmap('jet').copy()
+    finite = image[np.isfinite(image)]
+    if scale == 'log':
+        cmap.set_bad('black')  # LogNorm masks values <= 0
+        finite = finite[finite > 0]
+    if percentile is None:
+        vmin, vmax = (finite.min(), finite.max()) if scale == 'log' else (None, None)
+    else:
+        vmin, vmax = np.percentile(finite, percentile)
+    if scale == 'log':
+        show_kw = dict(cmap=cmap, norm=LogNorm(vmin=vmin, vmax=vmax))
+    else:
+        show_kw = dict(cmap=cmap, vmin=vmin, vmax=vmax)
 
     def on_select(eclick, erelease):
         x1, y1 = int(eclick.xdata), int(eclick.ydata)
@@ -1972,7 +2012,8 @@ def select_roi(image):
         print("Selected ROI:", roi_holder['roi'])
         
     fig, ax = plt.subplots()
-    ax.imshow(image, cmap='jet')
+    im = ax.imshow(image, **show_kw)
+    fig.colorbar(im, ax=ax, fraction=0.046, pad=0.02)
     ax.set_title("Draw a rectangle to select ROI, then close the window")
 
     selector = RectangleSelector(
@@ -1988,7 +2029,30 @@ def select_roi(image):
     selector.set_active(True)
     plt.show(block=True)  # Waits for user interaction and window close
 
-    return roi_holder.get('roi', None)
+    roi = roi_holder.get('roi', None)
+    if roi is not None:
+        row_start, col_start, row_width, col_width = roi
+
+        if output_path and not os.path.exists(output_path):
+            os.makedirs(output_path)
+            print("Directory '%s' created" % output_path)
+
+        fig_full, ax_full = plt.subplots()
+        ax_full.imshow(image, **show_kw)
+        ax_full.add_patch(plt.Rectangle((col_start, row_start), col_width, row_width,
+                                        edgecolor='white', facecolor='none', linewidth=2))
+        ax_full.set_title(f"ROI: {roi}")
+        fig_full.savefig(f"{output_path}roi_{roi}.png", dpi=150, bbox_inches='tight')
+        plt.close(fig_full)
+
+        fig_crop, ax_crop = plt.subplots()
+        ax_crop.imshow(image[row_start:row_start + row_width,
+                             col_start:col_start + col_width], **show_kw)
+        ax_crop.set_title(f"ROI crop: {roi}")
+        fig_crop.savefig(f"{output_path}roi_crop_{roi}.png", dpi=150, bbox_inches='tight')
+        plt.close(fig_crop)
+
+    return roi
 
 def slider_view(im_stack):
     # Create figure and axes
