@@ -583,9 +583,89 @@ def load_h5_data_db_parallel(sid_list, det, mon=None, roi=None, mask=None, thres
     
     return diff_data
 
+def sum_h5_data_db_single(sid, det, sum_over, mon=None, roi=None, mask=None, threshold=None, bins=1):
+    if sum_over == 'frames':
+        # unflipped so the summed image stays in the raw detector orientation used by roi
+        data = load_h5_data_db_v1(sid, det, mon, roi, mask, threshold, bins, flip=False)
+        return np.sum(data, axis=0)
+    data = load_h5_data_db_v1(sid, det, mon, roi, mask, threshold, bins)
+    return np.sum(data, axis=(1, 2))
 
+def sum_h5_data_db_parallel(sid_list, det, sum_over='frames', mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers=10, memory_safety=0.7):
+    """
+    Sum the detector data of each scan (located through databroker) without keeping the frames.
+    Multiple subscans of one scan ID are concatenated before summing.
 
+    sum_over:
+      'frames'     : sum over the scan points and over all scans; returns one detector image (row, col).
+      'det_pixels' : sum over the detector plane for each frame; returns (num_scans, num_positions).
+    Other parameters are the same as in load_h5_data_db_parallel.
+    """
+    if sum_over not in ('frames', 'det_pixels'):
+        raise ValueError("sum_over must be 'frames' or 'det_pixels'")
+    num_scans = np.size(sid_list)
+    max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = _cap_workers_by_memory(max_workers, _estimate_scan_bytes(sid_list[0], det, roi), safety=memory_safety)
+    ctx = mp.get_context("spawn") # fresh db session per subprocess
+    results = [None] * num_scans
+    with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
+        futures = {executor.submit(sum_h5_data_db_single, sid_list[i], det, sum_over, mon, roi, mask, threshold, bins): i for i in range(num_scans)}
+        for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):
+            idx = futures[future]
+            try:
+                results[idx] = future.result()
+            except Exception as e:
+                print(f"Error processing scan {sid_list[idx]}: {e}")
+    results = np.stack(results)
+    return np.sum(results, axis=0) if sum_over == 'frames' else results
 
+def _resolve_source(file_list, source):
+    if source not in ('auto', 'h5', 'db'):
+        raise ValueError("source must be 'auto', 'h5', or 'db'")
+    if source == 'db':
+        return 'db'
+    missing = [f for f in file_list if not os.path.isfile(f)]
+    if source == 'h5':
+        if missing:
+            raise FileNotFoundError(f"{len(missing)} of {len(file_list)} diffraction files are missing: {missing}")
+        return 'h5'
+    if not missing:
+        return 'h5'
+    if len(missing) == len(file_list):
+        return 'db'
+    raise ValueError(f"{len(missing)} of {len(file_list)} diffraction files are missing: {missing}")
+
+def load_diff_data(file_list, sid_list, det, mon=None, roi=None, mask=None, threshold=None, bins=1, max_workers=10, source='auto', memory_safety=0.7):
+    """
+    Load diffraction data from the h5 files in file_list or through databroker.
+
+    Parameters:
+      file_list: list of h5 file paths corresponding to the scans.
+      sid_list: list or array of scan IDs.
+      det: key to locate the detector information (passed to get_path).
+      mon: if provided, use monitor data to normalize each scan.
+      roi: a list of [row_start, col_start, row_size, col_size]. If None, the full image is used.
+      mask: an array to be multiplied with the detector data, applied to the sample image. Must be of appropriate shape.
+      threshold: two-element list [lower, upper] to clip pixel values.
+      bins (int): Binning factor for each frame.
+      max_workers: upper limit on worker processes; further reduced to fit available memory.
+      source: 'auto' (h5 files if all exist, databroker if none do, ValueError if only some do),
+              'h5' (require the files), or 'db' (always databroker).
+      memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is.
+      
+    Returns:
+      diff_data: stacked diffraction data with shape (num_scans, frames, row, col)
+                 (or, if only one scan exists, a rocking curve with angle moved to the first axis).
+    """
+    if _resolve_source(file_list, source) == 'h5':
+        if mon is not None:
+            warnings.warn("mon is ignored when loading from h5 files.")
+        print("Loading diffraction data from h5 files.")
+        return load_h5_data_parallel(file_list, roi=roi, mask=mask, threshold=threshold, bins=bins,
+                                    max_workers=max_workers, memory_safety=memory_safety)
+    print("Loading diffraction data from databroker.")
+    return load_h5_data_db_parallel(sid_list, det, mon=mon, roi=roi, mask=mask, threshold=threshold, bins=bins,
+                                    max_workers=max_workers, memory_safety=memory_safety)
 
 def load_and_sum_db(sid, det):
         sid = int(sid)
@@ -662,8 +742,70 @@ def sum_all_h5_data_db_parallel(sid_list, det, max_workers=10):
     return scan_sum_list
 
 
+def sum_h5_data_single(file_name, data_name, sum_over, roi=None, mask=None, threshold=None, bins=1):
+    if sum_over == 'frames':
+        # unflipped so the summed image stays in the raw detector orientation used by roi
+        data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins, flip=False)
+        return np.sum(data, axis=0)
+    data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins)
+    return np.sum(data, axis=(1, 2))
 
+def sum_h5_data_parallel(file_list, sum_over='frames', h5_type='diff_view', roi=None, mask=None, threshold=None, bins=1, max_workers=10, memory_safety=0.7):
+    """
+    Sum the detector data of each h5 file in file_list without keeping the frames.
+    File-based counterpart of sum_h5_data_db_parallel.
 
+    sum_over:
+      'frames'     : sum over the scan points and over all files; returns one detector image (row, col).
+      'det_pixels' : sum over the detector plane for each frame; returns (num_files, num_positions).
+    h5_type: 'diff_view' for files exported from diff_view, otherwise raw detector files.
+    Other parameters are the same as in load_h5_data_parallel.
+    """
+    if sum_over not in ('frames', 'det_pixels'):
+        raise ValueError("sum_over must be 'frames' or 'det_pixels'")
+    if file_list is None or len(file_list) == 0:
+        raise ValueError("file_list is empty or None.")
+    num_scans = len(file_list)
+    if h5_type == 'diff_view':
+        data_name = '/diff_data/merlin1/det_images'
+    else:
+        data_name = '/entry/instrument/detector/data'
+
+    with h5py.File(file_list[0], 'r') as f:
+        per_task_bytes = f[data_name].size * 4  # float32 working copy
+    max_workers = min(max_workers, os.cpu_count() or 1)
+    max_workers = _cap_workers_by_memory(max_workers, per_task_bytes, safety=memory_safety)
+
+    results = [None] * num_scans
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = {executor.submit(sum_h5_data_single, file_list[i], data_name, sum_over,
+                                   roi, mask, threshold, bins): i for i in range(num_scans)}
+        for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):
+            idx = futures[future]
+            results[idx] = future.result()
+
+    results = np.stack(results)
+    return np.sum(results, axis=0) if sum_over == 'frames' else results
+
+def sum_diff_data(file_list, sid_list, det, max_workers=10, sum_over='frames', mon=None, roi=None, mask=None, threshold=None, bins=1, source='auto', memory_safety=0.7):
+    """
+    Sum diffraction data from the h5 files in file_list or through databroker.
+    source: 'auto' (h5 files if all exist, databroker if none do, ValueError if only some do),
+            'h5' (require the files), or 'db' (always databroker).
+    memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is.
+    See sum_h5_data_db_parallel for sum_over.
+    """
+    if _resolve_source(file_list, source) == 'h5':
+        if mon is not None:
+            warnings.warn("mon is ignored when summing from h5 files.")
+        print("Summing diffraction data from h5 files.")
+        return sum_h5_data_parallel(file_list, sum_over=sum_over, roi=roi, mask=mask,
+                                    threshold=threshold, bins=bins, max_workers=max_workers,
+                                    memory_safety=memory_safety)
+    print("Summing diffraction data from databroker.")
+    return sum_h5_data_db_parallel(sid_list, det, sum_over=sum_over, mon=mon, roi=roi, mask=mask,
+                                   threshold=threshold, bins=bins, max_workers=max_workers,
+                                   memory_safety=memory_safety)
 
 
 def process_3d(subset, shift_matrix, index):
