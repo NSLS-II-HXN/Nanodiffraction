@@ -2149,7 +2149,7 @@ def read_params_db(sid_list,microscope='mll',det='merlin1'):
     th_step = get_baseline_fields(db[sid_list[1]],[th_name])[th_name] - get_baseline_fields(db[sid_list[0]],[th_name])[th_name]
 
     if np.abs(th_step) < 1e-3:
-        print(f"{th_name} doesn't seem to change over scans.Please switch to another microscope for the correct theta stage")
+        print(f"{th_name} doesn't seem to change over scans. Please switch to another microscope for the correct theta stage")
 
     det_pix = det_param[det]
 
