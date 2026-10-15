@@ -23,6 +23,8 @@ pyqt6 = ">=6.8.1,<7"
 
 [tasks]
 diff-analysis = "jupyter lab"
+diff-analysis-code = "code ."
+kernel-install = "python -m ipykernel install --user --name diffmap --display-name 'diffmap (pixi)'"
 
 [dependencies]
 h5py = ">=3.15.1,<4"
@@ -39,6 +41,7 @@ pims = ">=0.7,<0.8"
 doct = ">=1.1.0,<2"
 pytz = ">=2025.2,<2026"
 xarray = ">=2026.2.0,<2027"
+ffmpeg = ">=8.1.2,<9"
 
 [pypi-dependencies]
 hxntools = ">=0.6.5, <0.7"
