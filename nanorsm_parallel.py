@@ -310,10 +310,22 @@ def load_h5_data(file_list, roi, mask):
         print("Assume it is a rocking curve scan; number of angles = {}".format(diff_data.shape[0]))
     return diff_data 
 
-def load_h5_data_single(file_name,data_name,roi,mask,threshold,bins=1,flip=True):
+def read_h5_monitor(f, mon):
+    # Per-frame monitor values from scalar_data/scalar_array; mon is looked up in scalar_array_names.
+    names = [n.decode() if isinstance(n, bytes) else str(n) for n in f['/scalar_data/scalar_array_names'][:]]
+    if mon not in names:
+        raise KeyError(f"monitor '{mon}' not found in /scalar_data/scalar_array_names: {names}")
+    mon_array = np.asarray(f['/scalar_data/scalar_array'][names.index(mon)], dtype=np.float32).ravel()
+    nonzero = mon_array != 0
+    if nonzero.any():
+        mon_array[~nonzero] = mon_array[nonzero].mean()  # avoid division by zero
+    return mon_array
+
+def load_h5_data_single(file_name,data_name,roi,mask,threshold,bins=1,flip=True,mon=None):
     # Each thread will open a file, process it and return the index, data, and raw-size.
     # Using a context manager ensures the file is closed.
     with h5py.File(file_name, 'r', locking=False) as f:
+        mon_array = None if mon is None else read_h5_monitor(f, mon)
         dset = f[data_name]
         if roi is None:
             rs, cs = slice(None), slice(None)
@@ -333,6 +345,10 @@ def load_h5_data_single(file_name,data_name,roi,mask,threshold,bins=1,flip=True)
     if threshold is not None:
         data[data < threshold[0]] = 0
         data[data > threshold[1]] = 0
+    if mon_array is not None:
+        if mon_array.shape[0] < data.shape[0]:
+            raise ValueError(f"{file_name}: monitor has {mon_array.shape[0]} points but data has {data.shape[0]} frames")
+        data /= mon_array[:data.shape[0], np.newaxis, np.newaxis]
     return data
 
 def _estimate_h5_task_bytes(file_name, data_name, roi=None):
@@ -342,7 +358,7 @@ def _estimate_h5_task_bytes(file_name, data_name, roi=None):
         rows, cols = roi[2], roi[3]
     return n * rows * cols * 4  # float32 ROI buffer read by one worker
 
-def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None, h5_type='diff_view', bins=1, max_workers=10, memory_safety=0.7):
+def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None, h5_type='diff_view', bins=1, max_workers=10, memory_safety=0.7, mon=None):
     """
     Load a list of HDF5 (h5) files, apply optional ROI and mask,
     flip the data along axis=1, and stack the results along the first axis.
@@ -355,6 +371,7 @@ def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None, h5_typ
     bins: binning factor applied to each frame after the ROI crop
     max_workers: upper limit on worker processes; further reduced to fit available memory
     memory_safety: fraction of available memory the workers may use; outside [0, 1] uses max_workers as is
+    mon: name in /scalar_data/scalar_array_names (e.g. 'sclr1_ch4'); each frame is divided by that monitor value
     """
     data_type = 'float32'
     num_scans = len(file_list)
@@ -373,7 +390,7 @@ def load_h5_data_parallel(file_list, roi=None, mask=None, threshold=None, h5_typ
 
     results = None  # allocated on the first result to avoid a second full-size copy
     with ProcessPoolExecutor(max_workers=max_workers, mp_context=ctx) as executor:
-        futures = {executor.submit(load_h5_data_single, file_list[i],data_name,roi,mask,threshold,bins): i for i in range(num_scans)}
+        futures = {executor.submit(load_h5_data_single, file_list[i],data_name,roi,mask,threshold,bins,True,mon): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Progress"):
             idx = futures[future]
             try:
@@ -659,11 +676,9 @@ def load_diff_data(file_list, sid_list, det, mon=None, roi=None, mask=None, thre
                  (or, if only one scan exists, a rocking curve with angle moved to the first axis).
     """
     if _resolve_source(file_list, source) == 'h5':
-        if mon is not None:
-            warnings.warn("mon is ignored when loading from h5 files.")
         print("Loading diffraction data from h5 files.")
         return load_h5_data_parallel(file_list, roi=roi, mask=mask, threshold=threshold, bins=bins,
-                                    max_workers=max_workers, memory_safety=memory_safety)
+                                    max_workers=max_workers, memory_safety=memory_safety, mon=mon)
     print("Loading diffraction data from databroker.")
     return load_h5_data_db_parallel(sid_list, det, mon=mon, roi=roi, mask=mask, threshold=threshold, bins=bins,
                                     max_workers=max_workers, memory_safety=memory_safety)
@@ -743,15 +758,15 @@ def sum_all_h5_data_db_parallel(sid_list, det, max_workers=10):
     return scan_sum_list
 
 
-def sum_h5_data_single(file_name, data_name, sum_over, roi=None, mask=None, threshold=None, bins=1):
+def sum_h5_data_single(file_name, data_name, sum_over, roi=None, mask=None, threshold=None, bins=1, mon=None):
     if sum_over == 'frames':
         # unflipped so the summed image stays in the raw detector orientation used by roi
-        data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins, flip=False)
+        data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins, flip=False, mon=mon)
         return np.sum(data, axis=0)
-    data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins)
+    data = load_h5_data_single(file_name, data_name, roi, mask, threshold, bins, mon=mon)
     return np.sum(data, axis=(1, 2))
 
-def sum_h5_data_parallel(file_list, sum_over='frames', h5_type='diff_view', roi=None, mask=None, threshold=None, bins=1, max_workers=10, memory_safety=0.7):
+def sum_h5_data_parallel(file_list, sum_over='frames', h5_type='diff_view', roi=None, mask=None, threshold=None, bins=1, max_workers=10, memory_safety=0.7, mon=None):
     """
     Sum the detector data of each h5 file in file_list without keeping the frames.
     File-based counterpart of sum_h5_data_db_parallel.
@@ -780,7 +795,7 @@ def sum_h5_data_parallel(file_list, sum_over='frames', h5_type='diff_view', roi=
     results = [None] * num_scans
     with ProcessPoolExecutor(max_workers=max_workers) as executor:
         futures = {executor.submit(sum_h5_data_single, file_list[i], data_name, sum_over,
-                                   roi, mask, threshold, bins): i for i in range(num_scans)}
+                                   roi, mask, threshold, bins, mon): i for i in range(num_scans)}
         for future in tqdm(as_completed(futures), total=num_scans, desc="Processing Scans"):
             idx = futures[future]
             results[idx] = future.result()
@@ -797,12 +812,10 @@ def sum_diff_data(file_list, sid_list, det, max_workers=10, sum_over='frames', m
     See sum_h5_data_db_parallel for sum_over.
     """
     if _resolve_source(file_list, source) == 'h5':
-        if mon is not None:
-            warnings.warn("mon is ignored when summing from h5 files.")
         print("Summing diffraction data from h5 files.")
         return sum_h5_data_parallel(file_list, sum_over=sum_over, roi=roi, mask=mask,
                                     threshold=threshold, bins=bins, max_workers=max_workers,
-                                    memory_safety=memory_safety)
+                                    memory_safety=memory_safety, mon=mon)
     print("Summing diffraction data from databroker.")
     return sum_h5_data_db_parallel(sid_list, det, sum_over=sum_over, mon=mon, roi=roi, mask=mask,
                                    threshold=threshold, bins=bins, max_workers=max_workers,
